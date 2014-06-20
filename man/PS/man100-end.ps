@@ -1,0 +1,999 @@
+%!              for use by dvi2ps Version 2.00
+% a start (Ha!) at a TeX mode for PostScript.
+% The following defines procedures assumed and used by program "dvi2ps"
+% and must be downloaded or sent as a header file for all TeX jobs.
+
+% pkh@cs.nott.ac.uk Mon Feb 27 17:54:04 GMT 1989
+% Added tpic additions from someone else's hacked dvi2ps
+% which didn't handle gf files.
+
+% pkh@cs.nott.ac.uk Tue Jan 17 12:00:09 GMT 1989
+% position changed to set top left corner of TeX output 1" from top and left
+
+% By:  Neal Holtz, Carleton University, Ottawa, Canada
+%      <holtz@cascade.carleton.cdn>
+%      <holtz%cascade.carleton.cdn@ubc.csnet>
+%      June, 1985
+%      Last Modified: Aug 25/85
+% oystr 12-Feb-1986
+%   Changed @dc macro to check for a badly formed bits in character
+%   definitions.  Can get a <> bit map if a character is not actually
+%   in the font file.  This is absolutely guaranteed to drive the
+%   printer nuts - it will appear that you can no longer define a
+%   new font, although the built-ins will still be there.
+% pam 5-Jan-1988 
+%   Expanded arrays for 256 character gf fonts.
+
+% To convert this file into a downloaded file instead of a header
+% file, uncomment all of the lines beginning with %-%
+
+%-%0000000 			% Server loop exit password
+%-%serverdict begin exitserver
+%-%  systemdict /statusdict known
+%-%  {statusdict begin 9 0 3 setsccinteractive /waittimeout 300 def end}
+%-% if
+
+/TeXDict 200 dict def   % define a working dictionary
+TeXDict begin           % start using it.
+
+                        % units are in "dots" (300/inch)
+/Resolution 300 def
+/Inch  {Resolution mul} def  % converts inches to internal units
+
+/Mtrx 6 array def
+
+%%%%%%%%%%%%%%%%%%%%% Page setup (user) options %%%%%%%%%%%%%%%%%%%%%%%%
+
+% dvi2ps will output coordinates in the TeX system ([0,0] 1" down and in
+% from top left, with y +ive downward).  The default PostScript system
+% is [0,0] at bottom left, y +ive up.  The Many Matrix Machinations in
+% the following code are an attempt to reconcile that. The intent is to
+% specify the scaling as 1 and have only translations in the matrix to
+% properly position the text.  Caution: the default device matrices are
+% *not* the same in all PostScript devices; that should not matter in most 
+% of the code below (except for lanscape mode -- in that, rotations of
+% -90 degrees resulted in the the rotation matrix [ e 1 ]
+%                                                 [ 1 e ]
+% where the "e"s were almost exactly but not quite unlike zeros.
+
+/@letter
+  { letter initmatrix
+    72 Resolution div dup neg scale          % set scaling to 1.
+% originally (310,-3005) change, factor of (84,-9) needed to set top left
+% of TeX output at 1" from top and left
+    310 -3005 translate      % move origin to top (these are not exactly 1"
+    Mtrx currentmatrix pop   % and -10" because margins aren't set exactly right)
+  } def
+        % note mode is like letter, except it uses less VM
+/@note
+  { note initmatrix
+    72 Resolution div dup neg scale          % set scaling to 1.
+% originally (310,-3005) see letter
+    310 -3005 translate                      % move origin to top
+    Mtrx currentmatrix pop
+  } def
+
+/@landscape
+  { letter initmatrix
+    72 Resolution div dup neg scale          % set scaling to 1.
+%    -90 rotate                              % it would be nice to be able to do this
+    Mtrx currentmatrix 0 0.0 put             % but instead we have to do things like this because what
+    Mtrx 1 -1.0 put                          % should be zero terms aren't (and text comes out wobbly)
+    Mtrx 2 1.0 put                           % Fie!  This likely will not work on QMS printers
+    Mtrx 3 0.0 put                           % (nor on others where the device matrix is not like
+    Mtrx  setmatrix                          %  like it is on the LaserWriter).
+% originally (300, 310) see letter
+    300 310  translate                       % move origin to top
+    Mtrx currentmatrix pop
+  } def
+
+/@legal
+  { legal initmatrix
+    72 Resolution div dup neg scale          % set scaling to 1.
+% originally (295,-3880) see letter
+    295 -3880 translate                      % move origin to top
+    Mtrx currentmatrix pop
+  } def
+
+/@manualfeed
+   { statusdict /manualfeed true put
+   } def
+        % n @copies -   set number of copies
+/@copies
+   { /#copies exch def
+   } def
+
+%%%%%%%%%%%%%%%%%%%% Procedure Defintions %%%%%%%%%%%%%%%%%%%%%%%%%%
+
+/@newfont       % id @newfont -         -- initialize a new font dictionary
+  { /newname exch def
+    pop
+    newname 7 dict def          % allocate new font dictionary
+    newname load begin
+        /FontType 3 def
+        /FontMatrix [1 0 0 -1 0 0] def
+        /FontBBox [0 0 1 1] def
+% pam 5-Jan-1988 array enlarged for gf fonts
+        /BitMaps 256 array def
+        /BuildChar {CharBuilder} def
+        /Encoding 256 array def
+        0 1 255 {Encoding exch /.undef put} for
+        end
+    newname newname load definefont pop
+  } def
+
+
+% the following is the only character builder we need.  it looks up the
+% char data in the BitMaps array, and paints the character if possible.
+% char data  -- a bitmap descriptor -- is an array of length 6, of 
+%          which the various slots are:
+
+/ch-image {ch-data 0 get} def   % the hex string image
+/ch-width {ch-data 1 get} def   % the number of pixels across
+/ch-height {ch-data 2 get} def  % the number of pixels tall
+/ch-xoff  {ch-data 3 get} def   % number of pixels below origin
+/ch-yoff  {ch-data 4 get} def   % number of pixels to left of origin
+/ch-tfmw  {ch-data 5 get} def   % spacing to next character
+
+/CharBuilder    % fontdict ch Charbuilder -     -- image one character
+  { /ch-code exch def           % save the char code
+    /font-dict exch def         % and the font dict.
+    /ch-data font-dict /BitMaps get ch-code get def     % get the bitmap descriptor for char
+    ch-data null eq not
+      { ch-tfmw   0   ch-xoff neg   ch-yoff neg   ch-width ch-xoff sub   ch-height ch-yoff sub
+            setcachedevice
+        ch-width ch-height true [1 0  0 1  ch-xoff ch-yoff]
+            {ch-image} imagemask
+      }
+    if
+  } def
+
+
+/@sf            % fontdict @sf -        -- make that the current font
+  { setfont() pop
+  } def
+
+                % in the following, the font-cacheing mechanism requires that
+                % a name unique in the particular font be generated
+
+/@dc            % char-data ch @dc -    -- define a new character bitmap in current font
+  { /ch-code exch def
+% ++oystr 12-Feb-86++
+    dup 0 get
+    length 2 lt
+      { pop [ <00> 1 1 0 0 8.00 ] } % replace <> with null
+    if
+% --oystr 12-Feb-86--
+    /ch-data exch def
+    currentfont /BitMaps get ch-code ch-data put
+    currentfont /Encoding get ch-code 
+       dup (   ) cvs cvn   % generate a unique name simply from the character code
+       put
+  } def
+
+/@bop0           % n @bop0 -              -- begin the char def section of a new page
+  { 
+  } def
+
+/@bop1           % n @bop1 -              -- begin a brand new page
+  { pop
+    erasepage initgraphics 
+    Mtrx setmatrix
+    /SaveImage save def() pop
+  } def
+
+/@eop           % - @eop -              -- end a page
+  { showpage 
+    SaveImage restore() pop
+  } def
+
+/@start         % - @start -            -- start everything
+  { @letter                             % (there is not much to do)
+  } def
+
+/@end           % - @end -              -- done the whole shebang
+  { end
+  } def
+
+/p              % x y p -               -- move to position
+  { moveto
+  } def
+
+/r              % x r -                 -- move right
+  { 0 rmoveto
+  } def
+
+/s              % string s -            -- show the string
+  { show
+  } def
+
+/c              % ch c -                -- show the character (code given)
+  { c-string exch 0 exch put
+    c-string show
+  } def
+
+/c-string ( ) def
+
+/ru             % dx dy ru -   -- set a rule (rectangle)
+  { /dy exch neg def    % because dy is height up from bottom
+    /dx exch def
+    /x currentpoint /y exch def def   % remember current point
+    newpath x y moveto
+    dx 0 rlineto
+    0 dy rlineto
+    dx neg 0 rlineto
+    closepath fill
+    x y moveto
+  } def
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%     the \special command junk
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%   The structure of the PostScript produced by dvi2ps for \special is:
+%         @beginspecial
+%           - any number of @hsize, @hoffset, @hscale, etc., commands
+%         @setspecial
+%           - the users file of PostScript commands
+%         @endspecial
+
+% The @beginspecial command recognizes whether the Macintosh Laserprep
+% has been loaded or not, and redfines some Mac commands if so.
+% The @setspecial handles the users shifting, scaling, clipping commands
+
+
+% The following are user settable options from the \special command.
+
+/@SpecialDefaults
+  { /hs 8.5 Inch def
+    /vs 11 Inch def
+    /ho 0 def
+    /vo 0 def
+    /hsc 1 def
+    /vsc 1 def
+    /CLIP false def
+  } def
+
+%       d @hsize -      specify a horizontal clipping dimension
+%                       these 2 are executed before the MacDraw initializations
+/@hsize {/hs exch def /CLIP true def} def
+/@vsize {/vs exch def /CLIP true def} def
+%       d @hoffset -    specify a shift for the drwgs
+/@hoffset {/ho exch def} def
+/@voffset {/vo excl def} def
+%       s @hscale -     set scale factor
+/@hscale {/hsc exch def} def
+/@vscale {/vsc exch def} def
+
+/@setclipper
+  { hsc vsc scale
+    CLIP
+      { newpath 0 0 moveto hs 0 rlineto 0 vs rlineto hs neg 0 rlineto closepath clip }
+    if
+  } def
+
+% this will be invoked as the result of a \special command (for the
+% inclusion of PostScript graphics).  The basic idea is to change all
+% scaling and graphics back to defaults, but to shift the origin
+% to the current position on the page.  Due to TeXnical difficulties,
+% we only set the y-origin.  The x-origin is set at the left edge of
+% the page.
+
+/@beginspecial          % - @beginspecial -     -- enter special mode
+  { gsave /SpecialSave save def
+          % the following magic incantation establishes the current point as
+          % the users origin, and reverts back to default scalings, rotations
+    currentpoint transform initgraphics itransform translate
+    @SpecialDefaults    % setup default offsets, scales, sizes
+    @MacSetUp           % fix up Mac stuff 
+  } def
+
+/@setspecial    % to setup user specified offsets, scales, sizes (for clipping)
+  {
+    MacDrwgs
+      {md begin /pxt ho def /pyt vo neg def end}
+      {ho vo translate @setclipper}
+    ifelse
+  } def
+
+/@endspecial            % - @endspecial -       -- leave special mode
+  { SpecialSave restore
+    grestore
+  } def
+
+/MacDrwgs false def     % will get set if we think the Mac LaserPrep file has been loaded
+
+        % - @MacSetUp -   turn-off/fix-up all the MacDraw stuff that might hurt us
+                        % we depend on 'psu' being the first procedure executed
+                        % by a Mac document.  We redefine 'psu' to adjust page
+                        % translations, and to do all other the fixups required.
+                        % This stuff will not harm other included PS files
+/@MacSetUp
+  { userdict /md known  % if md is defined
+      { userdict /md get type /dicttype eq      % and if it is a dictionary
+         { /MacDrwgs true def
+           md begin                             % then redefine some stuff
+              /psu                              % redfine psu to set origins, etc.
+                /psu load
+                        % this procedure contains almost all the fixup code
+                { /letter {} def        % it is bad manners to execute the real
+                  /note {} def          %   versions of these (clears page image, etc.)
+                  /legal {} def
+                  statusdict /waittimeout 300 put
+                  /page {pop} def       % no printing of pages
+                  /pyt vo neg def       % x & y pixel translations
+                  /pxt ho def
+                }
+                concatprocs 
+              def
+              /od                               % redefine od to set clipping region
+                /od load
+                { @setclipper }
+                concatprocs
+              def
+           end }
+        if }
+    if    
+  } def
+
+%       p1 p2 concatprocs p       - concatenate procedures
+/concatprocs
+  { /p2 exch cvlit def 
+    /p1 exch cvlit def
+    /p p1 length p2 length add array def
+    p 0 p1 putinterval 
+    p p1 length p2 putinterval
+    p cvx
+  } def
+
+%%%% TPIC additions
+/ellipsedict 8 dict def
+ellipsedict /mtrx matrix put
+/ellipse
+{
+    ellipsedict begin
+    /endangle exch def	/startangle exch def
+    /yrad exch def	/xrad exch def
+    /y exch def		/x exch def
+
+    /savematrix mtrx currentmatrix def
+    x y translate
+    xrad yrad scale
+    0 0 1 startangle endangle arc
+    savematrix setmatrix
+    end
+} def
+
+% Draw a Chaikin spline, which is the same one ditroff uses.
+%
+% x1 y1 x2 y2 ... xn yn n ChaikinSplineDraw
+
+/ChaikinSplineSectionDict 20 dict def
+
+/ChaikinSplineSectionShow {	% paras : x1 y1 x2 y2 x3 y3 x4 y4
+    ChaikinSplineSectionDict begin
+	/y4 exch def /x4 exch def
+	/y3 exch def /x3 exch def
+	/y2 exch def /x2 exch def
+	/y1 exch def /x1 exch def
+	/xm x2 x3 add 2 div def	% xm = (x2 + x3) / 2
+	/ym y2 y3 add 2 div def	% ym = (y2 + y3) / 2
+	    x1 xm sub abs 3 lt
+	    y1 ym sub abs 3 lt
+	and			% abs(x1-xm)<3 && abs(y1-ym)<3
+	    { x1 y1 moveto xm ym lineto stroke }
+	    {
+	    xm ym x1 y1 x2 y2 x3 y3 x4 y4	% save these on the stack
+		x1 y1			% parameters for the next recursion
+		x1 x2 add 2 div y1 y2 add 2 div
+		x2 3 mul x3 add 4 div y2 3 mul y3 add 4 div
+		xm ym
+	    ChaikinSplineSectionShow
+	    /y4 exch def /x4 exch def
+	    /y3 exch def /x3 exch def
+	    /y2 exch def /x2 exch def
+	    /y1 exch def /x1 exch def
+	    /ym exch def /xm exch def	% pop them back
+	} ifelse
+
+	    xm x4 sub abs 3 lt
+	    ym y4 sub abs 3 lt
+	and			% abs(x1-xm)<3 && abs(y1-ym)<3
+	    { xm ym moveto x4 y4 lineto stroke }
+	    {   xm ym
+	    x2 x3 3 mul add 4 div y2 y3 3 mul add 4 div
+	    x3 x4 add 2 div y3 y4 add 2 div
+	    x4 y4
+	    ChaikinSplineSectionShow
+	} ifelse
+	end
+    } def
+
+/ChaikinSplineDict 22 dict def
+
+/ChaikinSplineDraw {
+    ChaikinSplineDict begin
+	/n exch def
+	n 2 mul -2 roll
+	/y1 exch def
+	/x1 exch def
+	/n n 1 sub def
+
+	n 2 mul -2 roll
+	/y2 exch def
+	/x2 exch def
+	/n n 1 sub def
+
+	/cx1 x1 x2 add 2 div def	% cx1 = (x1+x2)/2
+	/cy1 y1 y2 add 2 div def
+	/cx2 x1 3 x2 mul add 4 div def	% cx2 = (x1 + 3x2)/4
+	/cy2 y1 3 y2 mul add 4 div def
+
+	newpath x1 y1 moveto cx1 cy1 lineto
+
+	    {
+	    n 0 eq {exit} if
+	    /x1 x2 def /y1 y2 def
+	    n 2 mul -2 roll
+	    /y2 exch def
+	    /x2 exch def
+	    /n n 1 sub def
+	    /cx3 3 x1 mul x2 add 4 div def
+	    /cy3 3 y1 mul y2 add 4 div def
+	    /cx4 x1 x2 add 2 div def
+	    /cy4 y1 y2 add 2 div def
+	    cx1 cy1 cx2 cy2 cx3 cy3 cx4 cy4 ChaikinSplineSectionShow
+	    /cx1 cx4 def
+	    /cy1 cy4 def
+	    /cx2 x1 3 x2 mul add 4 div def
+	    /cy2 y1 3 y2 mul add 4 div def
+	} loop
+
+	cx1 cy1 moveto x2 y2 lineto stroke
+	end
+    } def
+%%%% End Of TPIC additions
+
+end                     % revert to previous dictionary
+% FigTeX support
+%
+% All software, documentation, and related files in this distribution of
+% psfig/tex are Copyright (c) 1987 Trevor J. Darrell
+%
+% Permission is granted for use and non-profit distribution of psfig/tex 
+% providing that this notice be clearly maintained, but the right to
+% distribute any portion of psfig/tex for profit or as part of any commercial
+% product is specifically reserved for the author.
+%
+% psfigTeX PostScript Prolog
+% /staff/jan/CVS/pl/man/PS/man100-end.ps,v 1.2 1992/06/04 14:18:42 jan Exp
+%
+/TeXscale { 65536 div } def
+
+/startTexFig {
+% usage :  x y bb-llx bb-lly bb-urx bb-ury startFig
+	/SavedState save def
+	userdict maxlength dict begin
+	currentpoint transform
+	initgraphics
+	itransform moveto
+
+	/ury exch TeXscale def
+	/urx exch TeXscale def
+	/lly exch TeXscale def
+	/llx exch TeXscale def
+	/y exch TeXscale def
+	/x exch TeXscale def
+	
+	currentpoint /cy exch def /cx exch def
+
+	/sx x urx llx sub div def 	% scaling for x
+	/sy y ury lly sub div def	% scaling for y
+
+	sx sy scale			% scale by (sx,sy)
+
+	cx sx div llx sub
+	cy sy div ury sub translate
+	
+	/DefFigCTM matrix currentmatrix def
+	/initmatrix {
+		DefFigCTM setmatrix
+	} def
+	/defaultmatrix {
+		DefFigCTM exch copy
+	} def
+	/exval {
+		load dup
+		dup xcheck exch
+		type /arraytype eq and {
+			aload pop
+		} if
+	} def
+	/initgraphics [
+		/initgraphics exval
+		DefFigCTM /setmatrix exval
+	] cvx def
+
+	/showpage {
+		initgraphics
+	} def
+%	/od {
+%		txpose 10 fz 0 fs F /|----3Courier fnt pop
+%	} def
+
+} def
+% Args are llx lly urx ury (in figure coordinates)
+/clipFig {
+	currentpoint 6 2 roll
+	newpath 4 copy
+	4 2 roll moveto
+	6 -1 roll exch lineto
+	exch lineto
+	exch lineto
+	closepath clip
+	moveto
+} def
+% doclip, if called, will always be just after a `startfig'
+/doclip { llx lly urx ury clipFig } def
+/endTexFig {
+	end SavedState restore
+} def
+
+% Macintosh support added by Jan Wielemaker (jan@swivax.UUCP) for
+% macintosh prep file version 36.0. Insert ``MacCorrect'' between ``md begin''
+% and the rest of the document
+
+/MacCorrect {
+    /txpose {
+	ok pgs 1680 eq
+%	1 index and{legal}if		% correction (avoid blanking page
+        pgs 1212 eq{dup{note}if 54 32.4 translate}if
+        pgs 1403 eq 1 index and{a4small}if
+        pgs 1320 eq and{note}if
+        pxs pys scale ppr aload pop
+	por {pop exch neg exch translate pop}
+	    {translate pop pop 270 rotate}
+	ifelse
+	1 -1 scale
+    }bdf
+    /cp {				% avoid new page after Mac Drawing
+	showpage
+	pm restore
+    } def
+} def
+TeXDict begin @start
+%%Title: doc.dvi
+%%Creator: dvips
+%%EndProlog
+100 @bop0
+[ 300 ] /cmr10.300 @newfont
+cmr10.300 @sf
+[<FFF00F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F000F00
+  0F000F00FFF0> 16 28 -1 0 14.990] 73 @dc
+[<FF8004001C000C0008000C0008001C0008003C0008003C0008007C0008007C000800F4000801E4000801E4000803C4000807
+  C40008078400080F0400080F0400081E0400083C0400083C04000878040008F8040008F0040009E0040009E004000BC00400
+  0F8004000F800E00FF007FC0> 32 28 -2 0 31.133] 78 @dc
+[<FFFFC0000F0070000F001C000F000E000F0007000F0007800F0003800F0003C00F0001C00F0001C00F0001E00F0001E00F00
+  01E00F0001E00F0001E00F0001E00F0001E00F0001E00F0001C00F0001C00F0003C00F0003800F0007000F0007000F000E00
+  0F003C000F00F000FFFFC000> 32 28 -2 0 31.709] 68 @dc
+[<FFFFFC000F003C000F000C000F0006000F0006000F0002000F0002000F0002000F0001000F0201000F0200000F0200000F02
+  00000F0600000FFE00000F0600000F0200000F0200000F0200000F0202000F0002000F0002000F0006000F0004000F000400
+  0F000C000F003C00FFFFFC00> 32 28 -2 0 28.250] 69 @dc
+[<FFC0FFF01F003F8006001F0002001E0003003C0001007C000080780000C0F8000041F0000021E0000023E0000013C000000F
+  8000000F8000000F0000001F0000001E0000003D0000007D80000078800000F0400001F0600001E0200003E0100003C01800
+  078018000FC03E007FF0FFC0> 32 28 -1 0 31.133] 88 @dc
+[<FFF80F800700070007000700070007000700070007000700070007000700070007000700070007000700070007000700C700
+  3F0007000300> 16 28 -4 0 20.755] 49 @dc
+[<0F800030C000203000701000781800780C00300C00000E0000060000060007C7000C2700181700300F00700F00600700E007
+  00E00700E00700E00700E00700E00600E00600600E00700C00300C001818000C300003C000> 24 29 -2 1 20.755] 57 @dc
+[<FFFE007FFE003FFE001002001801000C010006010003000001800000C000006000007000003800001C00001C00000E00000E
+  00000F00700700F80700F80700F80F00F00F00400E00400C00201C0018300007C000> 24 28 -2 0 20.755] 50 @dc
+[<FFE0FFE0> 16 2 0 -8 13.837] 45 @dc
+[<03E0000C3000181800300C00300E00700600600700600700E00700E00700E00700E00700E00700E00600F00E00F00C00E818
+  00E43000E3E000600000700000700000300C00301E00181E000C0E00060400030C0000F000> 24 29 -2 1 20.755] 54 @dc
+[<01FFC0001C00001C00001C00001C00001C00001C00001C00FFFFC0C01C00401C00201C00301C00101C00081C000C1C00041C
+  00021C00031C00011C00009C0000DC00005C00003C00003C00001C00000C00000C00> 24 28 -1 0 20.755] 52 @dc
+[ 300 ] /cmtt10.300 @newfont
+cmtt10.300 @sf
+[<C7E0FFF8FFFCF81EF00EE00E600E003C07F81FF07F807000E01CE01CF03C7FFC3FFC0FEC> 16 18 -3 0 21.793] 115 @dc
+[<0F83E03FE7E07FFFE0783E00E00E00E00E00E00E00700E003E0E001FFE0003FE00000E00000E00300E00783C007FF8003FF0
+  001FE000> 24 18 -2 0 21.793] 97 @dc
+[<00E00001F00001F00003B80003B80003B800071C00071C00071C00071C000E0E000E0E000E0E001E0F001C07007F1FC0FF1F
+  E07F1FC0> 24 18 -1 0 21.793] 118 @dc
+[<03F0000FFC001FFE003C0F00780700700700E00000E00000FFFF00FFFF00FFFF00E00700700700780E003C1E001FFC000FF8
+  0003E000> 24 18 -3 0 21.793] 101 @dc
+[<FFFF80FFFF80FFFF80> 24 3 -2 4 21.793] 95 @dc
+[<7FC000FFE0007FC0000E00000E00000E00000E00000E00000E00000E3C000EFF000FFF800F83C00F01E00E00E00E00700E00
+  700E00700E00700E00700E00700E00E00F00E00F83C07FFF80FEFF007E3E00> 24 27 0 9 21.793] 112 @dc
+[<FFFC00FFFC00FFFC0007000007000007000007000007000007000007000007000007800007800007C00007F040FF7FE0FF3F
+  E0FF0FC0> 24 18 -1 0 21.793] 114 @dc
+[<03E0000FF8001FFC003C1E00780F00700700F00780E00380E00380E00380E00380E00380700700780F003C1E001FFC000FF8
+  0003E000> 24 18 -2 0 21.793] 111 @dc
+[<03F8000FFE003FFF807C07C07001C0E000E0E000E0E000E0E000E07803C03FFF801FFF001FFC001800003800001BE0001FF0
+  000FF8001C1C00380E00380E00380E00380E00380E001C1CC00FFFE007F7E003E3C0> 24 28 -1 10 21.793] 103 @dc
+[<FE3C78FE7CF8FE7CF83870E03870E03870E03870E03870E03870E03870E03870E03870E03870E03C78E03C78E0FFFFE0FFEF
+  C0F9C380> 24 18 0 0 21.793] 109 @dc
+[<C00000E00000E000007000007000003800003800001C00001C00000E00000E000007000007000003800003800001C00001C0
+  0000E00000E000007000007000003800003800001C00001C00000E00000E00000700000700000380000380000180> 24 32 -2 3 21.793] 47 @dc
+[<7FFF80FFFF807FFF803803801E03800F000003800001C00000E000007000003800001C00000E000007000007000003800003
+  80600380F00380F00780E00700783E003FFC001FF80007E000> 24 25 -2 0 21.793] 50 @dc
+[<7FF87FFC7FF8038003800380038003800380038003800380038003800380038003807380FF807F800F800780038003800180> 16 25 -4 0 21.793] 49 @dc
+cmr10.300 @sf
+[<07E000183000201C00401C00F00E00F80F00F80F00F80F00700F00000F00000F00000E00001C00001C0000300007E0000060
+  00003000001800001C00001C00381E00781E00780E00781E00201C00201C0018300007E000> 24 29 -2 1 20.755] 51 @dc
+cmtt10.300 @sf
+[<7FFF00FFFF007FFF0001C00001C00001C00001C00001C00001C00001C00001C00001C00001C00001C00001C0007FC0007FC0
+  007FC00000000000000000000000000001800003C00003C000018000> 24 26 -3 0 21.793] 105 @dc
+[<7FC7F0FFE7F87FC7F00E03800E03800E03800E03800E03800E03800E03800E03800E03800E03800F03800F87807FFF00FEFE
+  007E3C00> 24 18 0 0 21.793] 110 @dc
+[<03E0000FF8001FFC001E3C003C1E00780F00700700700700F00780E00380E00380E00380E00380E00380E00380E00380E003
+  80700700700700780F00380E001E3C001FFC000FF80003E000> 24 25 -2 0 21.793] 48 @dc
+[<FFFF80FFFF80FFFF8001C00001C00001C00001C00001C00001C00001C00001C00001C00001C00001C00001C00001C00001C0
+  0001C00001C00001C00001C00001C000FFC000FFC000FFC000> 24 25 -2 0 21.793] 108 @dc
+[<03F0000FF8001FFC003E0E00780700700700F00000E00000E00000E00000E00000E00000700000780C003C1E001FFE000FFC
+  0003F800> 24 18 -3 0 21.793] 99 @dc
+[<00F80001FC0003FE00078700070380070380070380070100070000070000070000070000070000070000070000FFFF00FFFF
+  007FFF00070000070000070000070000030000> 24 23 -1 0 21.793] 116 @dc
+[<07E0001FF8003FFC00781E00E00700F00380600380000380000380000300000700001E0007FC0007F00007FC00003E00000E
+  00000700000700300700780700781E003FFC001FF80007E000> 24 25 -2 0 21.793] 51 @dc
+[<03E3F007FBF80FFFF00E0F800E03800E03800E03800E03800E03800E03800E03800E03800E03800E03800E03807E1F80FE3F
+  807E1F80> 24 18 0 0 21.793] 117 @dc
+[<3C00003F00007F80007BC00079C00001C00000E00000E00000E00000F00000F00000F00001B80001B800039800039C00039C
+  00071C00071C00070E000E0E000E0E000E07001C07007F1FC0FF9FE07F1FC0> 24 27 -1 9 21.793] 121 @dc
+cmr10.300 @sf
+[<07C000187000203800401C00401E00800E00F00F00F00F00F00F00600F00000F00000F00000F00000E00200E00301C002818
+  0024300023E0002000002000002000002000002000002000003FC0003FF0003FF800300C00> 24 29 -2 1 20.755] 53 @dc
+cmtt10.300 @sf
+[<3FFE007FFF003FFE0001C00001C00001C00001C00001C00001C00001C00001C00001C00001C00001C00001C000FFFF00FFFF
+  007FFF0001C00001C00001C30001E78000FF80007F80001F00> 24 25 -1 0 21.793] 102 @dc
+cmr10.300 @sf
+[<07E0001C1000300C00600400600200C00300C00300C00300C00300C00700600F00601E00307E0018FC0007F80007F0001FE0
+  003FB0003E0800780C00700600600600600600600600200600200C001008000C300003E000> 24 29 -2 1 20.755] 56 @dc
+cmtt10.300 @sf
+[<7FC7F0FFE7F87FC7F00E03800E03800E03800E03800E03800E03800E03800E03800E03800E03800F03800F87800FFF000EFE
+  000E3C000E00000E00000E00000E00007E0000FE00007E0000> 24 25 0 0 21.793] 104 @dc
+[<0F1E000F1E000F1E001DB7001DB7001DB7001DB70019B30019F30019F30038E380380380380380380380380380FF1FE0FFBF
+  E0FF1FE0> 24 18 -1 0 21.793] 119 @dc
+[<FFFFC0FFFFC0FFFFC07801C03C01C01E01C00F000007800003E00001F000007800003C00701E00700F007007807FFFC07FFF
+  C03FFFC0> 24 18 -1 0 21.793] 122 @dc
+cmr10.300 @sf
+[<03000007800007800007800007800007800007800003800003800003800003800001800001800001C00000C00000C0000040
+  000060000020000010000010008008008004008004004002007FFF007FFF007FFF80400000> 24 29 -2 1 20.755] 55 @dc
+cmtt10.300 @sf
+[<003FE0007FF0003FE000070000070000070000070000070000070007C7001FE7003FF7003C3F00700F00700F00E00700E007
+  00E00700E00700E00700E00700700F00700F003C1F001FF7000FE70007C700> 24 27 -2 9 21.793] 113 @dc
+cmr10.300 @sf
+[<07E0000C3000181800300C00300C00700E00600600600600E00700E00700E00700E00700E00700E00700E00700E00700E007
+  00E00700E00700E00700E00700600600600600700E00300C00300C001818000C300003C000> 24 29 -2 1 20.755] 48 @dc
+cmtt10.300 @sf
+[<7F87F0FFCFF07F87F00E07800E07000E0E000F1E000FBC000FF8000FF0000EF0000E78000E3C000E1E000E0F000E7FE00E7F
+  E00E7FE00E00000E00000E00000E00007E0000FE00007E0000> 24 25 0 0 21.793] 107 @dc
+[<063C000EFF000FFF800F83C00F01E00E00E00E00700E00700E00700E00700E00700E00700E00E00F00E00F83C00FFF800EFF
+  000E3E000E00000E00000E00000E00007E0000FE00007E0000> 24 25 0 0 21.793] 98 @dc
+[<01FFC001FFC001FFC0001C00001C00001C00001C00001C00FFFFE0FFFFE0FFFFE0F01C00781C00381C003C1C001E1C000E1C
+  000F1C00071C00039C00039C0001DC0000DC0000FC00007C00> 24 25 -1 0 21.793] 52 @dc
+[<7F1FC0FF3FE07F1FC00E0E00071C00073C0003B80001F00001E00000E00001F00003F00003B800073C000F1C007F1FC07F3F
+  C07F1FC0> 24 18 -1 0 21.793] 120 @dc
+[<07C7E00FE7F01FFFE03C1F00700F00700F00E00700E00700E00700E00700E00700E00700700700780F003C1F001FFF000FF7
+  0003C700000700000700000700000700003F00007F00003F00> 24 25 -1 0 21.793] 100 @dc
+[<60F0781C1E0E3E7E7E7C38> 8 11 -7 6 21.793] 44 @dc
+[<E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0> 8 32 -9 3 21.793] 124 @dc
+cmr10.300 @sf
+[<FFFFF0> 24 1 0 -11 20.755] 123 @dc
+100 @bop1
+cmr10.300 @sf
+118 42 p (INDEX) s
+1511 r (1992-6-4) s
+118 65 p 1800 2 ru
+cmtt10.300 @sf
+118 195 p (save_program/2) s
+cmr10.300 @sf
+14 r (16) s
+cmtt10.300 @sf
+118 245 p (see/1) s
+cmr10.300 @sf
+14 r (32) s
+cmtt10.300 @sf
+118 295 p (seeing/1) s
+cmr10.300 @sf
+14 r (33) s
+cmtt10.300 @sf
+118 346 p (seen/0) s
+cmr10.300 @sf
+14 r (33) s
+cmtt10.300 @sf
+118 396 p (select/3) s
+cmr10.300 @sf
+14 r (46) s
+cmtt10.300 @sf
+118 446 p (set_input/1) s
+cmr10.300 @sf
+14 r (34) s
+cmtt10.300 @sf
+118 496 p (set_output/1) s
+cmr10.300 @sf
+14 r (34) s
+cmtt10.300 @sf
+118 546 p (set_tty/2) s
+cmr10.300 @sf
+14 r (53) s
+cmtt10.300 @sf
+118 596 p (setenv/2) s
+cmr10.300 @sf
+14 r (54) s
+cmtt10.300 @sf
+118 647 p (setof/3) s
+cmr10.300 @sf
+14 r (48) s
+cmtt10.300 @sf
+118 697 p (sformat/2) s
+cmr10.300 @sf
+14 r (52) s
+cmtt10.300 @sf
+118 747 p (sformat/3) s
+cmr10.300 @sf
+14 r (52) s
+cmtt10.300 @sf
+118 797 p (shell/0) s
+cmr10.300 @sf
+14 r (53) s
+cmtt10.300 @sf
+118 847 p (shell/1) s
+cmr10.300 @sf
+14 r (53) s
+cmtt10.300 @sf
+118 897 p (shell/2) s
+cmr10.300 @sf
+14 r (53) s
+cmtt10.300 @sf
+118 948 p (show_profile/1) s
+cmr10.300 @sf
+14 r (58) s
+cmtt10.300 @sf
+118 998 p (sin/1) s
+cmr10.300 @sf
+14 r (44) s
+cmtt10.300 @sf
+118 1048 p (size_file/2) s
+cmr10.300 @sf
+14 r (54) s
+cmtt10.300 @sf
+118 1098 p (sleep/1) s
+cmr10.300 @sf
+14 r (61) s
+cmtt10.300 @sf
+118 1148 p (sort/2) s
+cmr10.300 @sf
+14 r (47) s
+cmtt10.300 @sf
+118 1198 p (source_file/1) s
+cmr10.300 @sf
+14 r (22) s
+cmtt10.300 @sf
+118 1249 p (source_file/2) s
+cmr10.300 @sf
+14 r (22) s
+cmtt10.300 @sf
+118 1299 p (spy/1) s
+cmr10.300 @sf
+14 r (56) s
+cmtt10.300 @sf
+118 1349 p (sqrt/1) s
+cmr10.300 @sf
+14 r (44) s
+cmtt10.300 @sf
+118 1399 p (statistics/0) s
+cmr10.300 @sf
+14 r (57) s
+cmtt10.300 @sf
+118 1449 p (statistics/2) s
+cmr10.300 @sf
+14 r (57) s
+cmtt10.300 @sf
+118 1499 p (stream_position/3) s
+cmr10.300 @sf
+14 r (34) s
+cmtt10.300 @sf
+118 1550 p (string/1) s
+cmr10.300 @sf
+14 r (24) s
+cmtt10.300 @sf
+118 1600 p (string_length/2) s
+cmr10.300 @sf
+14 r (40) s
+cmtt10.300 @sf
+118 1650 p (string_to_atom/2) s
+cmr10.300 @sf
+14 r (40) s
+cmtt10.300 @sf
+118 1700 p (string_to_list/2) s
+cmr10.300 @sf
+14 r (40) s
+cmtt10.300 @sf
+118 1750 p (style_check/1) s
+cmr10.300 @sf
+14 r (57) s
+cmtt10.300 @sf
+118 1800 p (sublist/3) s
+cmr10.300 @sf
+14 r (49) s
+cmtt10.300 @sf
+118 1851 p (subset/2) s
+cmr10.300 @sf
+14 r (47) s
+cmtt10.300 @sf
+118 1901 p (substring/4) s
+cmr10.300 @sf
+14 r (40) s
+cmtt10.300 @sf
+118 1951 p (subtract/3) s
+cmr10.300 @sf
+14 r (47) s
+cmtt10.300 @sf
+118 2001 p (succ/2) s
+cmr10.300 @sf
+14 r (42) s
+cmtt10.300 @sf
+118 2051 p (swritef/2) s
+cmr10.300 @sf
+14 r (50) s
+cmtt10.300 @sf
+118 2102 p (swritef/3) s
+cmr10.300 @sf
+14 r (50) s
+cmtt10.300 @sf
+118 2152 p (tab/1) s
+cmr10.300 @sf
+14 r (35) s
+cmtt10.300 @sf
+118 2202 p (tab/2) s
+cmr10.300 @sf
+14 r (35) s
+cmtt10.300 @sf
+118 2252 p (tan/1) s
+cmr10.300 @sf
+14 r (44) s
+cmtt10.300 @sf
+118 2302 p (tell/1) s
+cmr10.300 @sf
+14 r (32) s
+cmtt10.300 @sf
+118 2352 p (telling/1) s
+cmr10.300 @sf
+14 r (33) s
+cmtt10.300 @sf
+118 2403 p (term_expansion/2) s
+cmr10.300 @sf
+14 r (22) s
+cmtt10.300 @sf
+118 2453 p (term_to_atom/2) s
+cmr10.300 @sf
+14 r (39) s
+cmtt10.300 @sf
+118 2503 p (time/1) s
+cmr10.300 @sf
+14 r (57) s
+cmtt10.300 @sf
+118 2553 p (time_file/2) s
+cmr10.300 @sf
+14 r (54) s
+cmtt10.300 @sf
+118 2603 p (told/0) s
+cmr10.300 @sf
+14 r (33) s
+cmtt10.300 @sf
+118 2653 p (trace/0) s
+cmr10.300 @sf
+14 r (56) s
+cmtt10.300 @sf
+118 2704 p (tracing/0) s
+cmr10.300 @sf
+14 r (56) s
+cmtt10.300 @sf
+1091 195 p (trim_stacks/0) s
+cmr10.300 @sf
+14 r (59) s
+cmtt10.300 @sf
+1091 245 p (true/0) s
+cmr10.300 @sf
+14 r (25) s
+cmtt10.300 @sf
+1091 295 p (tty_fold/2) s
+cmr10.300 @sf
+14 r (35) s
+cmtt10.300 @sf
+1091 345 p (tty_get_capability/3) s
+cmr10.300 @sf
+14 r (53) s
+cmtt10.300 @sf
+1091 394 p (tty_goto/2) s
+cmr10.300 @sf
+14 r (53) s
+cmtt10.300 @sf
+1091 444 p (tty_put/2) s
+cmr10.300 @sf
+14 r (53) s
+cmtt10.300 @sf
+1091 494 p (ttyflush/0) s
+cmr10.300 @sf
+14 r (36) s
+cmtt10.300 @sf
+1091 544 p (union/3) s
+cmr10.300 @sf
+14 r (47) s
+cmtt10.300 @sf
+1091 594 p (unknown/2) s
+cmr10.300 @sf
+14 r (57) s
+cmtt10.300 @sf
+1091 643 p (unsetenv/1) s
+cmr10.300 @sf
+14 r (54) s
+cmtt10.300 @sf
+1091 693 p (use_module/1) s
+cmr10.300 @sf
+14 r (64) s
+cmtt10.300 @sf
+1091 743 p (use_module/2) s
+cmr10.300 @sf
+14 r (64) s
+cmtt10.300 @sf
+1091 793 p (var/1) s
+cmr10.300 @sf
+14 r (24) s
+cmtt10.300 @sf
+1091 843 p (visible/1) s
+cmr10.300 @sf
+14 r (56) s
+cmtt10.300 @sf
+1091 892 p (wait_for_input/3) s
+cmr10.300 @sf
+14 r (34) s
+cmtt10.300 @sf
+1091 942 p (wildcard_match/2) s
+cmr10.300 @sf
+14 r (60) s
+cmtt10.300 @sf
+1091 992 p (write/1) s
+cmr10.300 @sf
+14 r (36) s
+cmtt10.300 @sf
+1091 1042 p (write/2) s
+cmr10.300 @sf
+14 r (37) s
+cmtt10.300 @sf
+1091 1092 p (write_ln/1) s
+cmr10.300 @sf
+14 r (49) s
+cmtt10.300 @sf
+1091 1142 p (writef/1) s
+cmr10.300 @sf
+14 r (49) s
+cmtt10.300 @sf
+1091 1191 p (writef/2) s
+cmr10.300 @sf
+14 r (49) s
+cmtt10.300 @sf
+1091 1241 p (writeq/1) s
+cmr10.300 @sf
+14 r (37) s
+cmtt10.300 @sf
+1091 1291 p (writeq/2) s
+cmr10.300 @sf
+14 r (37) s
+cmtt10.300 @sf
+1091 1341 p (xor/2) s
+cmr10.300 @sf
+14 r (44) s
+cmtt10.300 @sf
+1091 1391 p (,/2) s
+cmr10.300 @sf
+14 r (26) s
+cmtt10.300 @sf
+1091 1440 p (|/2) s
+cmr10.300 @sf
+14 r (26) s
+952 2828 p 123 c
+14 r (100) s
+14 r 123 c
+@eop
+@end

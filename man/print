@@ -1,0 +1,12 @@
+#!/bin/csh -f
+#print manual
+
+if ( $#argv == 1 ) setenv PRINTER $1
+
+dvips -f 80       doc | lpr
+dvips -f 60 -t 79 doc | lpr
+dvips -f 40 -t 59 doc | lpr
+dvips -f 20 -t 39 doc | lpr
+dvips -f  2 -t 19 doc | lpr
+dvips       -t  1 doc | lpr
+
