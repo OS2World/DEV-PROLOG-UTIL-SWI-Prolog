@@ -1,15 +1,91 @@
-/*  pl-read.c,v 1.6 1993/02/23 13:16:44 jan Exp
+/*  $Id: pl-read.c,v 1.77 2001/05/15 16:08:25 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: read/1, 2
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
+#include <math.h>
+/*#define O_DEBUG 1*/
 #include "pl-incl.h"
 #include "pl-ctype.h"
-#include <math.h>
+
+		 /*******************************
+		 *	   CHAR-CONVERSION	*
+		 *******************************/
+
+static int  char_table[257];	/* also map -1 (EOF) */
+static int *char_conversion_table = &char_table[1];
+
+void
+initCharConversion()
+{ int i;
+
+  for(i=-1; i< 256; i++)
+    char_conversion_table[i] = i;
+}
+
+
+foreign_t
+pl_char_conversion(term_t in, term_t out)
+{ int cin, cout;
+
+  if ( !PL_get_char(in, &cin) ||
+       !PL_get_char(out, &cout) )
+    fail;
+
+  char_conversion_table[cin] = cout;
+
+  succeed;
+}
+
+
+foreign_t
+pl_current_char_conversion(term_t in, term_t out, word h)
+{ int ctx;
+  mark m;
+
+  switch( ForeignControl(h) )
+  { case FRG_FIRST_CALL:
+    { int cin;
+
+      if ( !PL_is_variable(in) )
+      { if ( PL_get_char(in, &cin) )
+	  return PL_unify_char(out, char_conversion_table[cin], CHAR_MODE);
+	fail;
+      }
+      ctx = 0;
+      break;
+    }
+    case FRG_REDO:
+      ctx = ForeignContextInt(h);
+      break;
+    case FRG_CUTTED:
+    default:
+      ctx = 0;				/* for compiler */
+      succeed;
+  }
+
+  Mark(m);
+  for( ; ctx < 256; ctx++)
+  { if ( PL_unify_char(in, ctx, CHAR_MODE) &&
+	 PL_unify_char(out, char_conversion_table[ctx], CHAR_MODE) )
+      ForeignRedoInt(ctx+1);
+    Undo(m);
+  }
+
+  fail;
+}
+
+
+		 /*******************************
+		 *	   TERM-READING		*
+		 *******************************/
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 This module defines the Prolog parser.  Reading a term takes two passes:
@@ -33,199 +109,242 @@ This module is considerably faster when compiled  with  GCC,  using  the
 -finline-functions option.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-forwards void	startRead P((void));
-forwards void	stopRead P((void));
-forwards void	errorWarning P((char *));
-forwards void	singletonWarning P((Atom *, int));
-forwards void	clearBuffer P((void));
-forwards void	addToBuffer P((char));
-forwards void	delBuffer P((void));
-forwards void	extendBeep P((void));
-forwards void	extendDeleteEscape P((void));
-forwards void	extendDeleteEof P((void));
-forwards void	extendReprint P((bool));
-forwards Char	getchr P((void));
-forwards char *	raw_read2 P((void));
-forwards char *	raw_read P((void));
-
 typedef struct token * Token;
-typedef struct variable * Variable;
+
+typedef struct
+{ char *	name;		/* Name of the variable */
+  term_t	variable;	/* Term-reference to the variable */
+  int		times;		/* Number of occurences */
+  word		signature;	/* Pseudo atom */
+} variable, *Variable;
+
 
 struct token
 { int type;			/* type of token */
+  long start;			/* start-position */
+  long end;			/* end-position */
   union
-  { word prolog;		/* a Prolog value */
-    char character;		/* a punctuation character (T_PUNCTUATION) */
-    Variable variable;		/* a variable record (T_VARIABLE) */
+  { number	number;		/* int or float */
+    atom_t	atom;		/* atom value */
+    term_t	term;		/* term (list or string) */
+    int		character;	/* a punctuation character (T_PUNCTUATION) */
+    Variable	variable;	/* a variable record (T_VARIABLE) */
   } value;			/* value of token */
 };
 
-struct variable
-{ Word		address;	/* address of variable */
-  char *	name;		/* name of variable */
-  int		times;		/* number of occurences */
-  Variable 	next;		/* next of chain */
+
+struct read_buffer
+{ int	size;			/* current size of read buffer */
+  unsigned char *base;		/* base of read buffer */
+  unsigned char *here;		/* current position in read buffer */
+  unsigned char *end;		/* end of the valid buffer */
+  IOSTREAM *stream;		/* stream we are reading from */
+};
+
+
+struct var_table
+{ buffer _var_name_buffer;	/* stores the names */
+  buffer _var_buffer;		/* array of struct variables */
 };
 
 #define T_FUNCTOR	0	/* name of a functor (atom, followed by '(') */
 #define T_NAME		1	/* ordinary name */
 #define T_VARIABLE	2	/* variable name */
 #define T_VOID		3	/* void variable */
-#define T_REAL		4	/* realing point number */
-#define T_INTEGER	5	/* integer */
-#define T_STRING	6	/* "string" */
-#define T_PUNCTUATION	7	/* punctuation character */
-#define T_FULLSTOP	8	/* Prolog end of clause */
+#define T_NUMBER	4	/* integer or float */
+#define T_STRING	5	/* "string" */
+#define T_PUNCTUATION	6	/* punctuation character */
+#define T_FULLSTOP	7	/* Prolog end of clause */
 
-extern int Input;		/* current input stream (from pl-file.c) */
-static char *here;		/* current character */
-static char *base;		/* base of clause */
-static char *token_start;	/* start of most recent read token */
-static struct token token;	/* current token */
-static bool unget = FALSE;	/* unget_token() */
+#define E_SILENT	0	/* Silently fail */
+#define E_EXCEPTION	1	/* Generate an exception */
+#define E_PRINT		2	/* Print to Serror */
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-The reading function (raw_read()) can  be  called  recursively  via  the
-notifier  when  running  under  notifier  based packages (like O_PCE).  To
-avoid corruption of the database we push the read buffer rb on  a  stack
-and pop in back when finished.  See raw_read() and raw_read2().
+Bundle all data required by the  various   passes  of read into a single
+structure.  This  makes  read  truly  reentrant,  fixing  problems  with
+interrupt and XPCE  call-backs  as   well  as  transparently  supporting
+multi-threading.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-#define RBSIZE	512		/* initial size of read buffer */
-#define MAX_READ_NESTING 5	/* nesting of read (O_PCE only) */
+typedef struct
+{ unsigned char *here;			/* current character */
+  unsigned char *base;			/* base of clause */
+  unsigned char *token_start;		/* start of most recent read token */
+  struct token token;			/* current token */
+  bool _unget;				/* unget_token() */
+  struct read_buffer _rb;		/* keep read characters here */
+  struct var_table vt;			/* Data about variables */
 
-static
-struct read_buffer
-{ int	size;			/* current size of read buffer */
-  int	left;			/* left space in read buffer */
-  char *base;			/* base of read buffer */
-  char *here;			/* current position in read buffer */
-  int   stream;			/* stream we are reading from */
-  FILE *fd;			/* file descriptor we are reading from */
-  bool	doExtend;		/* extension mode on? */
-} rb;
+  Module	module;			/* Current source module */
+  unsigned int	flags;			/* Module syntax flags */
 
-#if O_PCE
-static struct read_buffer rb_stack[MAX_READ_NESTING];
-int read_nesting = 0;		/* current nesting level */
-#endif /* O_PCE */
+  atom_t	on_error;		/* Handling of syntax errors */
+  int		has_exception;		/* exception is raised */
 
-void
-resetRead()
-{ 
-#if O_PCE
-  read_nesting = 0;
-#endif
-}
+  term_t	exception;		/* raised exception */
+  term_t	variables;		/* report variables */
+  term_t	varnames;		/* Report variables+names */
+  term_t	singles;		/* Report singleton variables */
+  term_t	subtpos;		/* Report Subterm positions */
+} read_data, *ReadData;
 
-static
-void
-startRead()
-{
-#if O_PCE
-  if (read_nesting >= MAX_READ_NESTING)
-  { warning("Read stack too deeply nested");
-    pl_abort();
-  }
-  rb_stack[read_nesting++] = rb;
-  rb = rb_stack[read_nesting];
-#endif /* O_PCE */
-  rb.doExtend = (Input == 0 && status.notty == FALSE);
-  rb.stream = Input;
-  rb.fd = checkInput(rb.stream);
-  source_file_name = currentStreamName();
+#define	rdhere		  (_PL_rd->here)
+#define	rdbase		  (_PL_rd->base)
+#define	last_token_start  (_PL_rd->token_start)
+#define	cur_token	  (_PL_rd->token)
+#define	unget		  (_PL_rd->_unget)
+#define	rb		  (_PL_rd->_rb)
+
+#define var_name_buffer	  (_PL_rd->vt._var_name_buffer)
+#define var_buffer	  (_PL_rd->vt._var_buffer)
+
+static void
+init_read_data(ReadData _PL_rd, IOSTREAM *in)
+{ memset(_PL_rd, 0, sizeof(*_PL_rd));	/* optimise! */
+
+  initBuffer(&var_name_buffer);
+  initBuffer(&var_buffer);
+  _PL_rd->exception = PL_new_term_ref();
+  rb.stream = in;
+  _PL_rd->module = MODULE_parse;
+  _PL_rd->flags  = _PL_rd->module->flags; /* change for options! */
+  _PL_rd->on_error = ATOM_error;
 }
 
 static void
-stopRead()
-{
-#if O_PCE
-  rb_stack[read_nesting] = rb;
-  rb = rb_stack[--read_nesting];
-  if (read_nesting < 0)
-    fatalError("Read stack underflow???");
-  if (read_nesting > 0)
-  { rb.fd = checkInput(rb.stream);
-  /*source_file_name = currentStreamName();*/
-  }
-#endif /* O_PCE */
+free_read_data(ReadData _PL_rd)
+{ if ( rdbase )
+    free(rdbase);
+
+  discardBuffer(&var_name_buffer);
+  discardBuffer(&var_buffer);
 }
+
+#define DO_CHARESCAPE true(_PL_rd, CHARESCAPE)
+
+#define RBSIZE	512		/* initial size of read buffer */
+
 
 		/********************************
 		*         ERROR HANDLING        *
 		*********************************/
 
-#define syntaxError(what) { errorWarning(what); fail; }
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Syntax Error exceptions:
 
-static void
-errorWarning(what)
-char *what;
-{ char c = *token_start;
-  
-  if ( !ReadingSource )			/* not reading from a file */
-  { fprintf(stderr, "\n[WARNING: Syntax error: %s \n", what);
-    *token_start = EOS;
-    fprintf(stderr, "%s\n** here **\n", base);  
-    if (c != EOS)
-    { *token_start = c;
-      fprintf(stderr, "%s]\n", token_start);
-    }
-  } else
-  { char *s;
-    word goal = globalFunctor(FUNCTOR_exception3);
-    word arg;
+	end_of_clause
+	end_of_clause_expected
+	end_of_file
+	end_of_file_in_atom
+	end_of_file_in_block_comment
+	end_of_file_in_string
+	illegal_number
+	long_atom
+	long_string
+	operator_clash
+	operator_expected
+	operator_balance
 
-    for(s = base; s < token_start; s++ )
-      if ( *s == '\n' )
-      	source_line_no++;
+Error term:
 
-    unifyAtomic(argTermP(goal, 0), ATOM_syntax_error);
-    unifyFunctor(argTermP(goal, 1), FUNCTOR_syntax_error3);
-    arg = argTerm(goal, 1);
-    unifyAtomic(argTermP(arg, 0), source_file_name);
-    unifyAtomic(argTermP(arg, 1), consNum(source_line_no));
-    unifyAtomic(argTermP(arg, 2), lookupAtom(what));
+	error(syntax_error(Id), file(Path, Line))
+	error(syntax_error(Id), string(String, CharNo))
+	error(syntax_error(Id), stream(Stream, Line, CharPos))
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-    if ( callGoal(MODULE_user, goal, FALSE) == FALSE )
-      warning("Syntax error: %s", what);
-  }
+
+#define syntaxError(what, rd) { errorWarning(what, rd); fail; }
+
+extern IOFUNCTIONS Sstringfunctions;
+
+static bool
+isStringStream(IOSTREAM *s)
+{ return s->functions == &Sstringfunctions;
 }
 
 
 static void
-singletonWarning(vars, nvars)
-Atom *vars;
-int nvars;
-{ word goal = globalFunctor(FUNCTOR_exception3);
-  word arg;
-  Word a;
+errorWarning(const char *id_str, ReadData _PL_rd)
+{ term_t ex = PL_new_term_ref();
+  term_t loc = PL_new_term_ref();
+
+  PL_unify_term(ex,
+		PL_FUNCTOR, FUNCTOR_error2,
+		  PL_FUNCTOR, FUNCTOR_syntax_error1,
+		    PL_CHARS, id_str,
+		  PL_TERM, loc);
+
+  source_char_no += last_token_start - rdbase;
+
+  if ( ReadingSource )			/* reading a file */
+  { PL_unify_term(loc,
+		  PL_FUNCTOR, FUNCTOR_file3,
+		    PL_ATOM, source_file_name,
+		    PL_INT, source_line_no,
+		    PL_LONG, source_char_no);
+  } else if ( isStringStream(rb.stream) )
+  { PL_unify_term(loc,
+		  PL_FUNCTOR, FUNCTOR_string2,
+		    PL_STRING, rdbase,
+		    PL_LONG, last_token_start-rdbase);
+  } else				/* any stream */
+  { term_t stream = PL_new_term_ref();
+
+    PL_unify_stream_or_alias(stream, rb.stream);
+    PL_unify_term(loc,
+		  PL_FUNCTOR, FUNCTOR_stream3,
+		    PL_TERM, stream,
+		    PL_INT, source_line_no,
+		    PL_LONG, source_char_no);
+  }
+
+  _PL_rd->has_exception = TRUE;
+  PL_put_term(_PL_rd->exception, ex);
+}
+
+
+static void
+singletonWarning(atom_t *vars, int nvars)
+{ fid_t cid = PL_open_foreign_frame();
+  term_t l = PL_new_term_ref();
+  term_t a = PL_copy_term_ref(l);
+  term_t h = PL_new_term_ref();
   int n;
 
-  unifyAtomic(argTermP(goal, 0), ATOM_singleton);
-  unifyFunctor(argTermP(goal, 1), FUNCTOR_singleton3);
-  arg = argTerm(goal, 1);
-  unifyAtomic(argTermP(arg, 0), source_file_name);
-  unifyAtomic(argTermP(arg, 1), consNum(source_line_no));
-  a = argTermP(arg, 2);
   for(n=0; n<nvars; n++)
-  { unifyFunctor(a, FUNCTOR_dot2);
-    unifyAtomic(argTermP(*a, 0), vars[n]);
-    a = argTermP(*a, 1);
+  { PL_unify_list(a, h, a);
+    PL_unify_atom(h, vars[n]);
+    PL_unregister_atom(vars[n]);
   }
-  unifyAtomic(a, ATOM_nil);
+  PL_unify_nil(a);
 
-  if ( callGoal(MODULE_user, goal, FALSE) == FALSE )
-  { char buf[LINESIZ];
+  printMessage(ATOM_warning,
+	       PL_FUNCTOR, FUNCTOR_singletons1,
+	         PL_TERM,    l);
 
-    buf[0] = EOS;
-    for(n=0; n<nvars; n++)
-    { if ( n > 0 )
-	strcat(buf, ", ");
-      strcat(buf, stringAtom(vars[n]));
-    }
+  PL_discard_foreign_frame(cid);
+}
 
-    warning("Singleton variables: %s", buf);
-  }
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+	FAIL	return false
+	TRUE	redo
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static int
+reportReadError(ReadData rd)
+{ if ( rd->on_error == ATOM_error )
+    return PL_raise_exception(rd->exception);
+  if ( rd->on_error == ATOM_quiet )
+    fail;
+
+  printMessage(ATOM_error, PL_TERM, rd->exception);
+  
+  if ( rd->on_error == ATOM_dec10 )
+    succeed;
+
+  fail;
 }
 
 
@@ -236,206 +355,202 @@ int nvars;
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Scan the input, give prompts when necessary and return a char *  holding
-a  stripped  version of the next term.  Contigeous white space is mapped
+a  stripped  version of the next term.  Contiguous white space is mapped
 on a single space, block and % ... \n comment  is  deleted.   Memory  is
 claimed automatically en enlarged if necessary.
-
-Earlier versions used to local stack for building the term.   This  does
-not  work  with  O_PCE  as  we might be called back via the notifier while
-reading.
 
 (char *) NULL is returned on a syntax error.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 static void
-clearBuffer()
+clearBuffer(ReadData _PL_rd)
 { if (rb.size == 0)
-  { if ((rb.base = Malloc(RBSIZE)) == (char *) NULL)
+  { if ( !(rb.base = (unsigned char *)malloc(RBSIZE)) )
       fatalError("%s", OsError());
     rb.size = RBSIZE;
   }
-  SECURE( if ( rb.base == 0 ) fatalError("read/1: nesting=%d, size=%d",
-						read_nesting, rb.size) );
-  rb.left = rb.size;
-  base = rb.here = rb.base;
-  DEBUG(8, printf("Cleared read buffer.rb at %ld, base at %ld\n", &rb, rb.base));
+  rb.end = rb.base + rb.size;
+  rdbase = rb.here = rb.base;
 }      
 
-#if PROTO
+#define addToBuffer(c, _PL_rd) \
+	do \
+        { \
+	  if ( rb.here >= rb.end ) \
+	    growToBuffer(c, _PL_rd); \
+	  else \
+	    *rb.here++ = c; \
+	} while(0)
+
 static void
-addToBuffer(
-register char c)
-#else
+growToBuffer(int c, ReadData _PL_rd)
+{ if ( !(rb.base = (unsigned char *)realloc(rb.base, rb.size * 2)) )
+    fatalError("%s", OsError());
+
+  DEBUG(8, Sdprintf("Reallocated read buffer at %ld\n", (long) rb.base));
+  rdbase = rb.base;
+  rb.here = rb.base + rb.size;
+  rb.size *= 2;
+  rb.end  = rb.base + rb.size;
+
+  *rb.here++ = c & 0xff;
+}
+
+
 static void
-addToBuffer(c)
-register char c;
-#endif
-{ if (rb.left-- == 0)
-  { if ((rb.base = Realloc(rb.base, rb.size * 2)) == (char *)NULL)
-      fatalError("%s", OsError());
-    DEBUG(8, printf("Reallocated read buffer at %ld\n", rb.base));
-    base = rb.base;
-    rb.here = rb.base + rb.size;
-    rb.left = rb.size - 1;
-    rb.size *= 2;
+setCurrentSourceLocation(IOSTREAM *s)
+{ atom_t a;
+
+  if ( s->position )
+  { source_line_no = s->position->lineno;
+    source_char_no = s->position->charno - 1; /* char just read! */
+  } else
+  { source_line_no = -1;
+    source_char_no = 0;
   }
-  *rb.here++ = c;
+
+  if ( (a = fileNameStream(s)) )
+    source_file_name = a;
+  else
+    source_file_name = NULL_ATOM;
 }
 
-static void
-delBuffer()
-{ if ( rb.here > rb.base )
-  { rb.here--;
-    rb.left++;
-  }
-}
 
-#if O_EXTEND_ATOMS
-
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Primitive functions to print and delete characters for  atom-completion.
-Should be abstracted from a bit and incorporated in the operating system
-interface.   As  this  model of atom-completion is unlikely to work on a
-non-Unix machine anyway this will do for the moment.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-static void
-extendBeep()
-{ if ( status.beep == TRUE )
-  { putchar(07);		/* ^G: the bel */
-    fflush(stdout);
-  }
-}
-
-#if O_LINE_EDIT				/* otherwise, define in md.h */
-#define DEL_ESC	"\b\b  \b\b"
-#define DEL_EOF "\b\b  \b\b"
-#endif /* O_LINE_EDIT */
-
-static void
-extendDeleteEscape()
-{ printf(DEL_ESC);
-  fflush(stdout);
-}
-
-static void
-extendDeleteEof()
-{ printf(DEL_EOF);
-  fflush(stdout);
-}
-
-static void
-extendReprint(reprint)
-bool reprint;
-{ ttybuf buf;
-  char *s, *start = rb.here - 1;
-
-  for(; *start != '\n' && start >= rb.base; start-- ) ;
-  start++;
-  PushTty(&buf, reprint ? TTY_APPEND : TTY_RETYPE);
-  for( s=start; s < rb.here; s++ )
-    PretendTyped(*s);
-  PopTty(&buf);
-  while(rb.here > start)
-    delBuffer();
-  fflush(stdout);
-}
-
-#endif /* O_EXTEND_ATOMS */
-
-static Char
-getchr()
-{ register Char c;
-
-  if (rb.fd == (FILE *)NULL)
-  { c =  Get0();
-    base = rb.base;
-  } else if ((c = (Char) Getc(rb.fd)) == '\n')
-    newLineInput();
-
-  return c;
-}
+#define getchr()  char_conversion_table[Sgetc(rb.stream)]
+#define getchrq() Sgetc(rb.stream)
 
 #define ensure_space(c) { if ( something_read && \
 			       (c == '\n'|| !isBlank(rb.here[-1])) ) \
-			   addToBuffer(c); \
+			   addToBuffer(c, _PL_rd); \
 		        }
 #define set_start_line { if ( !something_read ) \
-			 { source_file_name = currentStreamName(); \
-			   source_line_no = currentInputLine(); \
+			 { setCurrentSourceLocation(rb.stream); \
 			   something_read++; \
 			 } \
 		       }
 
-#define rawSyntaxError(what) { addToBuffer(EOS); \
-			       base = rb.base, token_start = rb.here-1; \
-			       syntaxError(what); \
+#define rawSyntaxError(what) { addToBuffer(EOS, _PL_rd); \
+			       rdbase = rb.base, last_token_start = rb.here-1; \
+			       syntaxError(what, _PL_rd); \
 			     }
 
-static char *
-raw_read2()
-{ register Char c;
-  bool something_read = FALSE;
-  int newlines;
+static int
+raw_read_quoted(int q, ReadData _PL_rd)
+{ int newlines = 0;
+  int c;
 
-  clearBuffer();				/* clear input buffer */
-  prompt(FALSE);				/* give prompt */
+  addToBuffer(q, _PL_rd);
+  while((c=getchrq()) != EOF && c != q)
+  { if ( c == '\\' && DO_CHARESCAPE )
+    { int base;
+      int xdigits;
+
+      addToBuffer(c, _PL_rd);
+
+      switch( (c=getchrq()) )
+      { case EOF:
+	  goto eofinstr;
+	case 'x':			/* \xNN\ */
+	  addToBuffer(c, _PL_rd);
+	  base = 16;
+	  xdigits = 2;
+	  goto xdigits;
+	default:
+	  addToBuffer(c, _PL_rd);
+	  if ( digitValue(8, c) >= 0 )	/* \NNN\ */
+	  { base = 8;
+	    xdigits = 2;
+	  } else
+	    continue;			/* \symbolic-control-char */
+	xdigits:
+	  c = getchrq();
+	  while( xdigits-- > 0 && digitValue(base, c) >= 0 )
+	  { addToBuffer(c, _PL_rd);
+	    c = getchrq();
+	  }
+	  if ( c == EOF )
+	    goto eofinstr;
+	  addToBuffer(c, _PL_rd);
+	  if ( c == q )
+	    return TRUE;
+	  continue;
+      }
+    } else if (c == '\n' &&
+	       newlines++ > MAXNEWLINES &&
+	       (debugstatus.styleCheck & LONGATOM_CHECK))
+    { rawSyntaxError("long_string");
+    }
+    addToBuffer(c, _PL_rd);
+  }
+  if (c == EOF)
+  { eofinstr:
+      rawSyntaxError("end_of_file_in_string");
+  }
+  addToBuffer(c, _PL_rd);
+
+  return TRUE;
+}
+
+
+
+static unsigned char *
+raw_read2(ReadData _PL_rd)
+{ int c;
+  bool something_read = FALSE;
+  bool dotseen = FALSE;
+  
+  clearBuffer(_PL_rd);				/* clear input buffer */
   source_line_no = -1;
 
   for(;;)
   { c = getchr();
-    DEBUG(3, if ( Input == 0 ) printf("getchr() -> %d (%c)\n", c, c));
-    DEBUG(3, if ( Input == 0 ) printf("here = %d, base = %d", rb.here, rb.base));
-    if ( c == ttytab.tab.c_cc[ VEOF ] ) c = EOF ;
+
+  handle_c:
     switch(c)
     { case EOF:
-		if (seeingString())		/* do not require '. ' when */
-		{ addToBuffer(' ');		/* reading from a string */
-		  addToBuffer('.');
-		  addToBuffer(' ');
-		  addToBuffer(EOS);
+		if ( isStringStream(rb.stream) ) /* do not require '. ' when */
+		{ addToBuffer(' ', _PL_rd);     /* reading from a string */
+		  addToBuffer('.', _PL_rd);
+		  addToBuffer(' ', _PL_rd);
+		  addToBuffer(EOS, _PL_rd);
 		  return rb.base;
 		}
 		if (something_read)
-		{
-#if O_EXTEND_ATOMS
-		  if ( rb.doExtend == TRUE )
-		  { char *a;
-
-		    addToBuffer(EOS);		/* allocates if need be */
-		    delBuffer();
-		    a = rb.here - 1;
-		    for( ;a >= rb.base && isAlpha(*a); a--) ;
-		    a++;
-		    extendDeleteEof();
-		    if ( a >= rb.here || !isLower(*a) )
-		    { extendReprint(FALSE);
-		      extendBeep();
-		      break;
-		    }
-		    Put('\n');
-		    extendAlternatives(a);
-		    extendReprint(TRUE);
-		    break;
-		  }		  
-#endif /* O_EXTEND_ATOMS */
-		  rawSyntaxError("Unexpected end of file");
+		{ if ( dotseen )		/* term.<EOF> */
+		  { if ( rb.here - rb.base == 1 )
+		      rawSyntaxError("end_of_clause");
+		    ensure_space(' ');
+		    addToBuffer(EOS, _PL_rd);
+		    return rb.base;
+		  }
+		  rawSyntaxError("end_of_file");
 		}
-      e_o_f:
-		strcpy(rb.base, "end_of_file. ");
+		if ( Sfpasteof(rb.stream) )
+		{ warning("Attempt to read past end-of-file");
+		  return NULL;
+		}
+		set_start_line;
+		strcpy((char *)rb.base, "end_of_file. ");
+		rb.here = rb.base + 14;
 		return rb.base;
-      case '*':	if ( rb.here-rb.base >= 1 && rb.here[-1] == '/' )
-		{ register char last;
+      case '/': c = getchr();
+		if ( c == '*' )
+		{ int last;
 		  int level = 1;
 
-		  rb.here--, rb.left++;	/* delete read '/' */
-
 		  if ((last = getchr()) == EOF)
-		    rawSyntaxError("End of file in ``/* ... */'' comment");
+		    rawSyntaxError("end_of_file_in_block_comment");
+
+		  if ( something_read )
+		  { addToBuffer(' ', _PL_rd);	/* positions */
+		    addToBuffer(' ', _PL_rd);
+		    addToBuffer(last == '\n' ? last : ' ', _PL_rd);
+		  }
+
 		  for(;;)
 		  { switch(c = getchr())
 		    { case EOF:
-			rawSyntaxError("End of file in ``/* ... */'' comment");
+			rawSyntaxError("end_of_file_in_block_comment");
 		      case '*':
 			if ( last == '/' )
 			  level++;
@@ -443,153 +558,128 @@ raw_read2()
 		      case '/':
 			if ( last == '*' && --level == 0 )
 			{ c = ' ';
-			  goto case_default; /* hack */
+			  goto handle_c;
 			}
 			break;
-		      case '\n':
-			if ( something_read )
-			  addToBuffer(c);
 		    }
+		    if ( something_read )
+		      addToBuffer(c == '\n' ? c : ' ', _PL_rd);
 		    last = c;
 		  }
+		} else
+		{ set_start_line;
+		  addToBuffer('/', _PL_rd);
+		  if ( isSymbol(c) )
+		  { while( c != EOF && isSymbol(c) )
+		    { addToBuffer(c, _PL_rd);
+		      c = getchr();
+		    }
+		  }
+		  dotseen = FALSE;
+		  goto handle_c;
 		}
-
-		set_start_line;
-		addToBuffer(c);
-		break;
-      case '%': while((c=getchr()) != EOF && c != '\n') ;
-		if (c == EOF)
-		{ if (something_read)
-		    rawSyntaxError("Unexpected end of file")
-		  else
-		    goto e_o_f;		  
+      case '%': if ( something_read )
+		  addToBuffer(' ', _PL_rd);	/* positions */
+		while((c=getchr()) != EOF && c != '\n')
+		{ if ( something_read )		/* record positions */
+		    addToBuffer(' ', _PL_rd);
 		}
-
-		goto case_default;		/* Hack */
+		c = '\n';
+		goto handle_c;
      case '\'': if ( rb.here > rb.base && isDigit(rb.here[-1]) )
-		{ addToBuffer(c);			/* <n>' */
+		{ addToBuffer(c, _PL_rd); 		/* <n>' */
 		  if ( rb.here[-2] == '0' )		/* 0'<c> */
 		  { if ( (c=getchr()) != EOF )
-		    { addToBuffer(c);
+		    { addToBuffer(c, _PL_rd);
 		      break;
 		    }
-		    rawSyntaxError("Unexpected end of file");
+		    rawSyntaxError("end_of_file");
 		  }
+		  dotseen = FALSE;
 		  break;
 		}
 
-		set_start_line;
-		newlines = 0;
-		addToBuffer(c);
-		while((c=getchr()) != EOF && c != '\'')
-		{ if (c == '\n' &&
-		       newlines++ > MAXNEWLINES &&
-		       (debugstatus.styleCheck & LONGATOM_CHECK))
-		    rawSyntaxError("Atom too long");
-		  addToBuffer(c);
-		}
-		if (c == EOF)
-		  rawSyntaxError("End of file in quoted atom");
-		addToBuffer(c);
+     		set_start_line;
+     		if ( !raw_read_quoted(c, _PL_rd) )
+		  fail;
+		dotseen = FALSE;
 		break;
       case '"':	set_start_line;
-		newlines = 0;
-		addToBuffer(c);
-		while((c=getchr()) != EOF && c != '"')
-		{ if (c == '\n' &&
-		       newlines++ > MAXNEWLINES &&
-		       (debugstatus.styleCheck & LONGATOM_CHECK))
-		    rawSyntaxError("String too long");
-		  addToBuffer(c);
-		}
-		if (c == EOF)
-		  rawSyntaxError("End of file in string");
-		addToBuffer(c);
+                if ( !raw_read_quoted(c, _PL_rd) )
+		  fail;
+		dotseen = FALSE;
 		break;
-#if O_EXTEND_ATOMS
-      case ESC: if ( rb.doExtend == TRUE )
-		{ char *a;
-		  char *extend;
-		  bool unique;
-
-		  addToBuffer(EOS);		/* allocates if need be */
-		  delBuffer();
-		  a = rb.here - 1;
-		  for( ;a >= rb.base && isAlpha(*a); a--) ;
-		  a++;
-		  if ( a >= rb.here || !isLower(*a) )
-		  { extendDeleteEscape();
-		    extendReprint(FALSE);
-		    extendBeep();
-		    break;
+      case '.': addToBuffer(c, _PL_rd);
+		set_start_line;
+		dotseen++;
+		c = getchr();
+		if ( isSymbol(c) )
+		{ while( c != EOF && isSymbol(c) )
+		  { addToBuffer(c, _PL_rd);
+		    c = getchr();
 		  }
-		  if ( (extend = extendAtom(a, &unique)) != (char *)NULL )
-		  { ttybuf buf;
-
-		    extendDeleteEscape();
-		    extendReprint(FALSE);
-		    PushTty(&buf, TTY_APPEND);
-		    while(*extend)
-		      PretendTyped(*extend++);
-		    PopTty(&buf);
-		    if ( unique == FALSE )
-		      extendBeep();
-		  } else
-		  { extendDeleteEscape();
-		    extendReprint(FALSE);
-		    extendBeep();
-		  }
-		  break;		  
+		  dotseen = FALSE;
 		}
-		/*FALLTHROUGH*/
-#endif /* O_EXTEND_ATOMS */
-      case_default:				/* Hack, needs fixing */
-      default:	if ( isBlank(c) )
-		{ long rd;
-
-		  rd = rb.here - rb.base;
-		  if (rd == 1 && rb.here[-1] == '.')
-		    rawSyntaxError("Unexpected end of clause");
-		  if (rd >= 2)
-		  { if ( rb.here[-1] == '.' &&
-			 !isSymbol(rb.here[-2]) &&
-			 !(rb.here[-2] == '\'' && rd >= 3 && rb.here[-3] == '0'))
-		    { ensure_space(c);
-		      addToBuffer(EOS);
+		goto handle_c;
+      default:	switch(_PL_char_types[c])
+		{ case SP:
+		  case CT:
+		    if ( dotseen )
+		    { if ( rb.here - rb.base == 1 )
+			rawSyntaxError("end_of_clause");
+		      ensure_space(c);
+		      addToBuffer(EOS, _PL_rd);
 		      return rb.base;
 		    }
-		  }
-		  ensure_space(c);
-		  if ( c == '\n' )
-		    prompt(TRUE);
-		} else
-		{ addToBuffer(c);
-		  if ( c != '/' )	/* watch comment start */
+		    do
+		    { if ( something_read ) /* positions */
+			addToBuffer(c == '\n' ? c : ' ', _PL_rd);
+		      else
+			ensure_space(c);
+		      c = getchr();
+		    } while( c != EOF && isBlank(c) );
+		    goto handle_c;
+		  case SY:
+		    set_start_line;
+		    do
+		    { addToBuffer(c, _PL_rd);
+		      c = getchr();
+		    } while( c != EOF && isSymbol(c) == SY );
+		    dotseen = FALSE;
+		    goto handle_c;
+		  case LC:
+		  case UC:
+		    set_start_line;
+		    do
+		    { addToBuffer(c, _PL_rd);
+		      c = getchr();
+		    } while( c != EOF && isAlpha(c) );
+		    dotseen = FALSE;
+		    goto handle_c;
+		  default:
+		    addToBuffer(c, _PL_rd);
+		    dotseen = FALSE;
 		    set_start_line;
 		}
-		break;
     }
   }
-}  
+}
 
-static char *
-raw_read()
-{ char *s;
 
-  startRead();
-#if O_EXTEND_ATOMS
-  if ( Input == 0 && status.notty == FALSE )
-  { ttybuf buf;
+static unsigned char *
+raw_read(ReadData _PL_rd)
+{ if ( rb.stream->flags & SIO_ISATTY )
+  { unsigned char *s;
+    ttybuf tab;
+    
+    PushTty(rb.stream, &tab, TTY_SAVE);		/* make sure tty is sane */
+    PopTty(rb.stream, &ttytab);
+    s = raw_read2(_PL_rd);
+    PopTty(rb.stream, &tab);
 
-    PushTty(&buf, TTY_EXTEND_ATOMS);
-    s = raw_read2();
-    PopTty(&buf);
+    return s;
   } else
-#endif
-    s = raw_read2();
-  stopRead();
-
-  return s;
+    return raw_read2(_PL_rd);
 }
 
 
@@ -597,473 +687,651 @@ raw_read()
 		*        VARIABLE DATABASE       *
 		**********************************/
 
-#define VARHASHSIZE 16
-#define MAX_SINGLETONS 250
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+These functions manipulate the  variable-name  base   for  a  term. When
+building the term on the global stack, variables are represented using a
+reference to a `struct variable'. The first  part of this structure is a
+struct atom, so if a garbage   collection happens, the garbage collector
+will simply assume an atom.
 
-static char *	 allocBase;		/* local allocation base */
-#if !O_DYNAMIC_STACKS
-static char *    allocTop;		/* top of allocation */
-#endif
-static Variable* varTable;		/* hashTable for variables */
+The buffer `var_buffer' is a  list  of   pointers  to  a  stock of these
+variable structures. This list is dynamically expanded if necessary. The
+buffer var_name_buffer contains the  actual   strings.  They  are packed
+together to avoid memory fragmentation. This   buffer too is reallocated
+if necessary. In this  case,  the   pointers  of  the  existing variable
+structures are relocated.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-forwards void	check_singletons P((void));
-forwards bool	bind_variables P((Word));
-forwards char *	alloc_var P((size_t));
-forwards char *	save_var_name P((char *));
-forwards Variable lookupVariable P((char *));
-forwards void	initVarTable P((void));
+#define MAX_SINGLETONS 256
 
-static void
-check_singletons()
-{ register Variable var;
-  int n;
-  Atom singletons[MAX_SINGLETONS];
-  int i=0;
-
-  for(n=0; n<VARHASHSIZE; n++)
-  { for(var = varTable[n]; var; var=var->next)
-    { if (var->times == 1 && var->name[0] != '_' && i < MAX_SINGLETONS)
-	singletons[i++] = lookupAtom(var->name);
-    }
-  }
-  
-  if ( i > 0 )
-    singletonWarning(singletons, i);
-}
-
-/*  construct a list of Var = <name> terms wich indicate the bindings
-    of the variables. Anonymous variables are skipped. The result is
-    unified with the argument.
-
- ** Sat Apr 16 23:09:04 1988  jan@swivax.UUCP (Jan Wielemaker)  */
-
-static bool
-bind_variables(bindings)
-Word bindings;
-{ Variable var;
-  int n;
-  word binding;
-  Word arg;
-
-  for(n=0; n<VARHASHSIZE; n++)
-  { for(var = varTable[n]; var; var=var->next)
-    { if (var->name[0] != '_')
-      { binding = globalFunctor(FUNCTOR_equals2);
-	arg     = argTermP(binding, 0);
-	*arg++  = (word) lookupAtom(var->name);
-	*arg    = makeRef(var->address);
-	APPENDLIST(bindings, &binding);
-      }
-    }
-  }
-  CLOSELIST(bindings);
-
-  succeed;
-}
+#define for_vars(v, code) \
+	{ Variable v   = baseBuffer(&var_buffer, variable); \
+	  Variable _ev = topBuffer(&var_buffer, variable); \
+	  for( ; v < _ev; v++ ) { code; } \
+	}
 
 static char *
-alloc_var(n)
-register size_t n;
-{ register char *space;
+save_var_name(const char *name, ReadData _PL_rd)
+{ int l = strlen(name);
+  char *nb, *ob = baseBuffer(&var_name_buffer, char);
+  int e = entriesBuffer(&var_name_buffer, char);
 
-  n = ROUND(n, sizeof(word));
+  addMultipleBuffer(&var_name_buffer, name, l+1, char);
+  if ( (nb = baseBuffer(&var_name_buffer, char)) != ob )
+  { ptrdiff_t shift = nb - ob;
 
-  STACKVERIFY(if (allocBase + n > allocTop) outOf((Stack)&stacks.local) );
+    for_vars(v, v->name += shift);
+  }
 
-  space = allocBase;
-  allocBase += n;
-
-  return space;
+  return baseBuffer(&var_name_buffer, char) + e;
 }
 
-static char *
-save_var_name(s)
-char *s;
-{ char *copy = alloc_var(strlen(s) + 1);
-
-  strcpy(copy, s);
-
-  return copy;
-}
+					/* use hash-key? */
 
 static Variable
-lookupVariable(s)
-char *s;
-{ int v = stringHashValue(s, VARHASHSIZE);
+isVarAtom(word w, ReadData _PL_rd)
+{ if ( tagex(w) == (TAG_ATOM|STG_GLOBAL) )
+    return &baseBuffer(&var_buffer, variable)[w>>7];
+  
+  return NULL;
+}
+
+
+static Variable
+lookupVariable(const char *name, ReadData _PL_rd)
+{ variable next;
   Variable var;
+  int nv;
 
-  for(var=varTable[v]; var; var=var->next)
-  { if (streq(s, var->name) )
-    { var->times++;
-      return var;
-    }
+  if ( name[0] != '_' || name[1] != EOS ) /* anonymous: always add */
+  { for_vars(v,
+	     if ( streq(name, v->name) )
+	     { v->times++;
+	       return v;
+	     })
   }
-  var = (Variable) alloc_var((size_t) sizeof(struct variable));
-  DEBUG(9, printf("Allocated var at %ld\n", var));
-  var->next = varTable[v];
-  varTable[v] = var;
-  var->name = save_var_name(s);
-  var->times = 1;
-  var->address = (Word) NULL;
+       
+  nv = entriesBuffer(&var_buffer, variable);
+  next.name      = save_var_name(name, _PL_rd);
+  next.times     = 1;
+  next.variable  = 0;
+  next.signature = (nv<<7)|TAG_ATOM|STG_GLOBAL;
+  addBuffer(&var_buffer, next, variable);
+  var = topBuffer(&var_buffer, variable);
 
-  return var;
+  return var-1;
 }
 
-static void
-initVarTable()
-{ int n;
 
-  allocBase = (char *)(lTop+1) + (MAXARITY+MAXVARIABLES) * sizeof(word);
-#if !O_DYNAMIC_STACKS
-  allocTop  = (char *)lMax;
-#endif
+static bool
+check_singletons(ReadData _PL_rd)
+{ if ( _PL_rd->singles != TRUE )	/* returns <name> = var bindings */
+  { term_t list = PL_copy_term_ref(_PL_rd->singles);
+    term_t head = PL_new_term_ref();
 
-  varTable = (Variable *)alloc_var((size_t) sizeof(Variable)*VARHASHSIZE);
-  for(n=0; n<VARHASHSIZE; n++)
-    varTable[n] = (Variable) NULL;
+    for_vars(var,
+	     if ( var->times == 1 && var->name[0] != '_' )
+	     {	if ( !PL_unify_list(list, head, list) ||
+		     !PL_unify_term(head,
+				    PL_FUNCTOR, FUNCTOR_equals2,
+				    PL_CHARS,	var->name,
+				    PL_TERM,    var->variable) )
+		  fail;
+	     });
+
+    return PL_unify_nil(list);
+  } else				/* just report */
+  { atom_t singletons[MAX_SINGLETONS];
+    int i = 0;
+
+    for_vars(var,
+	     if ( var->times == 1 && var->name[0] != '_' )
+	     { if ( i < MAX_SINGLETONS )
+		 singletons[i++] = PL_new_atom(var->name);
+	     });
+
+    if ( i > 0 )
+      singletonWarning(singletons, i);
+
+    succeed;
+  }
 }
+
+
+static bool
+bind_variable_names(ReadData _PL_rd)
+{ term_t list = PL_copy_term_ref(_PL_rd->varnames);
+  term_t head = PL_new_term_ref();
+  term_t a    = PL_new_term_ref();
+
+  for_vars(var,
+	   if ( var->name[0] != '_' )
+	   { if ( !PL_unify_list(list, head, list) ||
+		  !PL_unify_functor(head, FUNCTOR_equals2) ||
+		  !PL_get_arg(1, head, a) ||
+		  !PL_unify_atom_chars(a, var->name) ||
+		  !PL_get_arg(2, head, a) ||
+		  !PL_unify(a, var->variable) )
+	       fail;
+	   });
+
+  return PL_unify_nil(list);
+}
+
+
+static bool
+bind_variables(ReadData _PL_rd)
+{ term_t list = PL_copy_term_ref(_PL_rd->variables);
+  term_t head = PL_new_term_ref();
+
+  for_vars(var,
+	   if ( !PL_unify_list(list, head, list) ||
+		!PL_unify(head, var->variable) )
+	     fail;
+	   );
+
+  return PL_unify_nil(list);
+}
+
 
 		/********************************
 		*           TOKENISER           *
 		*********************************/
 
-#define skipSpaces	{ while(isBlank(*here) ) here++; c = *here++; }
+#define skipSpaces	{ while(isBlank(*rdhere) ) rdhere++; c = *rdhere++; }
 #define unget_token()	{ unget = TRUE; }
 
-forwards Token	get_token P((bool));
-forwards word	build_term P((Atom, int, Word));
-forwards bool	complex_term P((char *, Word));
-forwards bool	simple_term P((bool, Word, bool *));
-forwards bool	read_term P((Word, Word, bool));
-
-typedef union
-{ long	i;
-  real  r;
-} number;
-
-#define V_ERROR 0
-#define V_REAL  1
-#define V_INT   2
-
-forwards int scan_number P((char **, int, number *));
+forwards Token	get_token(bool, ReadData _PL_rd);
+typedef const unsigned char * cucharp;
+typedef       unsigned char * ucharp;
 
 static int
-scan_number(s, b, n)
-char **s;
-int b;
-number *n;
+scan_number(cucharp *s, int b, Number n)
 { int d;
+  unsigned long maxi = PLMAXINT/b;	/* cache? */
+  unsigned long t = 0;
 
-  n->i = 0;
   while((d = digitValue(b, **s)) >= 0)
   { (*s)++;
-    n->i = n->i * b + d;
-    if ( n->i > PLMAXINT )
-    { n->r = (real) n->i;
+
+    if ( t > maxi )
+    { real maxf = MAXREAL / (real) b - (real) b;
+      real tf = (real)t;
+
+      tf = tf * (real)b + (real)d;
       while((d = digitValue(b, **s)) >= 0)
       { (*s)++;
-        if ( n->r > MAXREAL / (real) b - (real) d )
-	  return V_ERROR;
-        n->r = n->r * (real)b + (real)d;
+        if ( tf > maxf )
+	  fail;				/* number too large */
+        tf = tf * (real)b + (real)d;
       }
-      return V_REAL;
-    }
+      n->value.f = tf;
+      n->type = V_REAL;
+      succeed;
+    } else
+      t = t * b + d;
   }  
 
-  return V_INT;
+  if ( t > PLMAXINT )
+  { n->value.f = (real)t;
+    n->type = V_REAL;
+    succeed;
+  }
+
+  n->value.i = t;
+  n->type = V_INTEGER;
+  succeed;
+}
+
+
+#define NEXT(v)	do { c = (v); goto next; } while(0) 
+
+static void
+get_string(unsigned char *in, unsigned char **end, Buffer buf,
+	   ReadData _PL_rd)
+{ int quote;
+  char c;
+
+  quote = *in++;
+
+  for(;;)
+  { c = *in++;
+
+    if ( c == quote )
+    { if ( *in == quote )
+      { in++;
+	NEXT(quote);
+      }
+
+      break;
+    }
+    if ( c == '\\' && DO_CHARESCAPE )
+    { int c2;
+      int base;
+      int xdigits;
+      
+      switch((c2 = *in++))
+      { case 'a':
+	  NEXT(7);			/* 7 is ASCII BELL */
+	case 'b':
+	  NEXT('\b');
+	case 'c':
+	  while(isBlank(*in))
+	    in++;
+	  continue;
+	case 10:			/* linefeed */
+	  while(isBlank(*in) && *in != 10 )
+	    in++;
+	  continue;
+	case 'f':
+	  NEXT('\f');
+	case 'n':
+	  NEXT('\n');
+	case 'r':
+	  NEXT('\r');
+	case 't':
+	  NEXT('\t');
+	case 'v':
+	  NEXT(11);			/* 11 is ASCII Vertical Tab */
+	case 'x':
+	  c2 = *in++;
+	  if ( digitValue(16, c2) >= 0 )
+	  { base = 16;
+	    xdigits = 1;
+	    goto numchar;
+	  } else
+	    NEXT('x');
+	default:
+	  if ( c2 >= '0' && c2 <= '7' )	/* octal number */
+	  { int chr;
+	    int dv;
+
+	    base = 8;
+	    xdigits = 2;
+
+	  numchar:
+	    chr = digitValue(base, c2);
+	    c2 = *in++;
+	    while(xdigits-- > 0 &&
+		  (dv = digitValue(base, c2)) >= 0 )
+	    { chr = chr * base + dv;
+	      c2 = *in++;
+	    }
+	    if ( c2 != '\\' )
+	      in--;
+	    NEXT(chr);
+	  } else
+	    NEXT(c2);
+      }
+    }
+
+  next:
+    addBuffer(buf, c, char);
+  }
+
+  if ( end )
+    *end = in;
+}  
+
+
+int
+get_number(cucharp in, ucharp *end, Number value)
+{ int negative = FALSE;
+  unsigned int c;
+
+  if ( *in == '-' )			/* skip optional sign */
+  { negative = TRUE;
+    in++;
+  } else if ( *in == '+' )
+    in++;
+
+  if ( *in == '0' )
+  { int base = 0;
+
+    switch(in[1])
+    { case '\'':			/* 0'<char> */
+      { if ( isAlpha(in[3]) )
+	  fail;				/* illegal number */
+	value->value.i = (long)in[2] & 0xff;
+	if ( negative )			/* -0'a is a bit dubious! */
+	  value->value.i = -value->value.i;
+	*end = (ucharp)in+3;
+	value->type = V_INTEGER;
+	succeed;
+      }
+      case 'b':
+	base = 2;
+        break;
+      case 'x':
+	base = 16;
+        break;
+      case 'o':
+	base = 8;
+        break;
+    }
+
+    if ( base )				/* 0b<binary>, 0x<hex>, 0o<oct> */
+    { int rval;
+      in += 2;
+      rval = scan_number(&in, base, value);
+      *end = (ucharp)in;
+      if ( negative )
+	 value->value.i = -value->value.i;
+      return rval;
+    }
+  }
+
+  if ( !isDigit(*in) || !scan_number(&in, 10, value) )
+    fail;				/* too large? */
+
+					/* base'value number */
+  if ( *in == '\'' )
+  { in++;
+
+    if ( !intNumber(value) || value->value.i > 36 )
+      fail;				/* illegal base */
+    if ( !scan_number(&in, (int)value->value.i, value) )
+      fail;				/* number too large */
+
+    if ( isAlpha(*in) )
+      fail;				/* illegal number */
+
+    if ( negative )
+    { if ( intNumber(value) )
+	value->value.i = -value->value.i;
+      else
+	value->value.f = -value->value.f;
+    }
+
+    *end = (ucharp)in;
+    succeed;
+  }
+					/* Real numbers */
+  if ( *in == '.' && isDigit(in[1]) )
+  { double n;
+
+    if ( intNumber(value) )
+    { value->value.f = (double) value->value.i;
+      value->type = V_REAL;
+    }
+    n = 10.0, in++;
+    while( isDigit(c = *in) )
+    { in++;
+      value->value.f += (double)(c-'0') / n;
+      n *= 10.0;
+    }
+  }
+
+  if ( *in == 'e' || *in == 'E' )
+  { number exponent;
+    bool neg_exponent;
+
+    in++;
+    DEBUG(9, Sdprintf("Exponent\n"));
+    switch(*in)
+    { case '-':
+	in++;
+        neg_exponent = TRUE;
+	break;
+      case '+':
+	in++;
+      default:
+	neg_exponent = FALSE;
+        break;
+    }
+
+    if ( !scan_number(&in, 10, &exponent) || !intNumber(&exponent) )
+      fail;				/* too large exponent */
+
+    if ( intNumber(value) )
+    { value->value.f = (double) value->value.i;
+      value->type = V_REAL;
+    }
+
+    value->value.f *= pow((double)10.0,
+			  neg_exponent ? -(double)exponent.value.i
+			               : (double)exponent.value.i);
+  }
+
+  if ( negative )
+  { if ( intNumber(value) )
+      value->value.i = -value->value.i;
+    else
+      value->value.f = -value->value.f;
+  }
+
+  *end = (ucharp)in;
+  succeed;
 }
 
 
 static Token
-get_token(must_be_op)
-bool must_be_op;
-{ char c;
-  char *start;
-  char end;
-  int negative = 1;
+get_token(bool must_be_op, ReadData _PL_rd)
+{ unsigned int c;
+  unsigned char *start;
+  int end;
 
-  if (unget)
+  if ( unget )
   { unget = FALSE;
-    return &token;
+    return &cur_token;
   }
 
   skipSpaces;
-  token_start = here - 1;
-  switch(char_type[(unsigned)c & 0xff])
-  { case LC:	{ start = here-1;
-		  while(isAlpha(*here) )
-		    here++;
-		  c = *here;
-		  *here = EOS;
-		  token.value.prolog = (word)lookupAtom(start);
-		  *here = c;
-		  token.type = (c == '(' ? T_FUNCTOR : T_NAME);
-		  DEBUG(9, printf("%s: %s\n", c == '(' ? "FUNC" : "NAME", stringAtom(token.value.prolog)));
+  last_token_start = rdhere - 1;
+  cur_token.start = source_char_no + last_token_start - rdbase;
+  switch(_PL_char_types[c])
+  { case LC:	{ start = rdhere-1;
+		  while(isAlpha(*rdhere) )
+		    rdhere++;
+		  c = *rdhere;
+		  cur_token.value.atom = lookupAtom((char *)start,
+						    rdhere-start);
+		  cur_token.type = (c == '(' ? T_FUNCTOR : T_NAME);
+		  DEBUG(9, Sdprintf("%s: %s\n", c == '(' ? "FUNC" : "NAME",
+				    stringAtom(cur_token.value.atom)));
 
-		  return &token;
+		  break;
 		}
-    case UC:	{ start = here-1;
-		  while(isAlpha(*here) )
-		    here++;
-		  c = *here;
-		  *here = EOS;
-		  if (start[0] == '_' && here == start + 1)
-		  { setVar(token.value.prolog);
-		    DEBUG(9, printf("VOID\n"));
-		    token.type = T_VOID;
-		  } else
-		  { token.value.variable = lookupVariable(start);
-		    DEBUG(9, printf("VAR: %s\n", token.value.variable->name));
-		    token.type = T_VARIABLE;
+    case UC:	{ start = rdhere-1;
+		  while(isAlpha(*rdhere) )
+		    rdhere++;
+		  c = *rdhere;
+		  *rdhere = EOS;
+		  if ( c == '(' && trueFeature(ALLOW_VARNAME_FUNCTOR) )
+		  { cur_token.value.atom = lookupAtom((char *)start,
+						      rdhere-start);
+		    cur_token.type = T_FUNCTOR;
+		    *rdhere = c;
+		    break;
 		  }
-		  *here = c;
+		  if ( start[0] == '_' &&
+		       rdhere == start + 1 &&
+		       !_PL_rd->variables ) /* report them */
+		  { DEBUG(9, Sdprintf("VOID\n"));
+		    cur_token.type = T_VOID;
+		  } else
+		  { cur_token.value.variable = lookupVariable((char *)start,
+							      _PL_rd);
+		    DEBUG(9, Sdprintf("VAR: %s\n",
+				      cur_token.value.variable->name));
+		    cur_token.type = T_VARIABLE;
+		  }
+		  *rdhere = c;
 
-		  return &token;
+		  break;
 		}
     case_digit:
     case DI:	{ number value;
-		  int tp;
 
-		  if (c == '0' && *here == '\'')		/* 0'<char> */
-		  { if (isAlpha(here[2]))
-		    { here += 2;
-		      syntaxError("Illegal number");
-		    }
-		    token.value.prolog = consNum((long)here[1] * negative);
-		    token.type = T_INTEGER;
-		    here += 2;
-
-		    DEBUG(9, printf("INT: %ld\n", valNum(token.value.prolog)));
-		    return &token;
-		  }
-
-		  here--;		/* start of token */
-		  if ( (tp = scan_number(&here, 10, &value)) == V_ERROR )
-		    syntaxError("Number too large");
-
-					/* base'value number */
-		  if ( *here == '\'' )
-		  { here++;
-
-		    if ( tp == V_REAL || value.i > 36 )
-		      syntaxError("Base of <base>'<value> too large");
-		    if ( (tp = scan_number(&here, (int)value.i, &value))
-								== V_ERROR )
-		      syntaxError("Number too large"); 
-
-		    if (isAlpha(*here) )
-		      syntaxError("Illegal number");
-
-		    if ( tp == V_INT )
-		    { token.value.prolog = consNum(value.i * negative);
-		      token.type = T_INTEGER;
-		    } else
-		    { token.value.prolog = globalReal(value.r * negative);
-		      token.type = T_REAL;
-		    }
-
-		    return &token;
-		  }
-					/* Real numbers */
-		  if ( *here == '.' && isDigit(here[1]) )
-		  { real n;
-
-		    if ( tp == V_INT )
-		    { value.r = (real) value.i;
-		      tp = V_REAL;
-		    }
-		    n = 10.0, here++;
-		    while(isDigit(c = *here) )
-		    { here++;
-		      value.r += (real)(c-'0') / n;
-		      n *= 10.0;
-		    }
-		  }
-
-		  if ( *here == 'e' || c == 'E' )
-		  { number exponent;
-		    bool neg_exponent;
-
-		    here++;
-		    DEBUG(9, printf("Exponent\n"));
-		    switch(*here)
-		    { case '-':		here++;
-					neg_exponent = TRUE;
-					break;
-		      case '+':		here++;
-		      default:		neg_exponent = FALSE;
-					break;
-		    }
-
-		    if ( scan_number(&here, 10, &exponent) != V_INT )
-		      syntaxError("Exponent too large");
-
-		    if ( tp == V_INT )
-		    { value.r = (real) value.i;
-		      tp = V_REAL;
-		    }
-
-		    value.r *= pow((double)10.0,
-				   neg_exponent ? -(double)exponent.i
-				                : (double)exponent.i);
-		  }
-
-		  if ( isAlpha(c = *here) )
-		    syntaxError("Illegal number");
-
-		  if ( tp == V_REAL )
-		  { token.value.prolog = globalReal(value.r * negative);
-		    token.type = T_REAL;
+		  if ( get_number(&rdhere[-1], &rdhere, &value) &&
+		       !isAlpha(rdhere[0]) )
+		  { cur_token.value.number = value;
+		    cur_token.type = T_NUMBER;
+		    break;
 		  } else
-		  { token.value.prolog = consNum(value.i * negative);
-		    token.type = T_INTEGER;
-		  }
-
-		  return &token;
-		}		  
-    case SO:	{ char tmp[2];
-
-		  tmp[0] = c, tmp[1] = EOS;
-		  token.value.prolog = (word) lookupAtom(tmp);
-		  token.type = T_NAME;
-		  DEBUG(9, printf("NAME: %s\n", stringAtom(token.value.prolog)));
-
-		  return &token;
+		    syntaxError("illegal_number", _PL_rd);
 		}
-    case SY:	{ if (c == '.' && isBlank(here[0]))
-		  { token.type = T_FULLSTOP;
-		    return &token;
-		  }
-		  start = here - 1;
-		  while( isSymbol(*here) )
-		    here++;
-		  end = *here, *here = EOS;
-		  token.value.prolog = (word) lookupAtom(start);
-		  *here = end;
-		  if ( !must_be_op && isDigit(end) ) /* +- <number> case */
-		  { if ( token.value.prolog == (word) ATOM_minus )
-		    { negative = -1;
-		      c = *here++;
-		      goto case_digit;
-		    } else if ( token.value.prolog == (word) ATOM_plus )
-		    { c = *here++;
-		      goto case_digit;
+    case SO:	{ char tmp[1];
+
+		  tmp[0] = c;
+		  cur_token.value.atom = lookupAtom(tmp, 1);
+		  cur_token.type = (*rdhere == '(' ? T_FUNCTOR : T_NAME);
+		  DEBUG(9, Sdprintf("%s: %s\n",
+				  *rdhere == '(' ? "FUNC" : "NAME",
+				  stringAtom(cur_token.value.atom)));
+
+		  break;
+		}
+    case SY:	{ start = rdhere - 1;
+		  while( isSymbol(*rdhere) )
+		    rdhere++;
+		  end = *rdhere;
+
+		  if ( rdhere == start+1 )
+		  { if ( (c == '+' || c == '-') &&	/* +- number */
+			 !must_be_op &&
+			 isDigit(*rdhere) )
+		    { goto case_digit;
+		    }
+		    if ( c == '.' && isBlank(*rdhere) )	/* .<blank> */
+		    { cur_token.type = T_FULLSTOP;
+		      break;
 		    }
 		  }
-		  token.type = (end == '(' ? T_FUNCTOR : T_NAME);
-		  DEBUG(9, printf("%s: %s\n", end == '(' ? "FUNC" : "NAME", stringAtom(token.value.prolog)));
 
-		  return &token;
+		  cur_token.value.atom = lookupAtom((char *)start, rdhere-start);
+		  cur_token.type = (end == '(' ? T_FUNCTOR : T_NAME);
+		  DEBUG(9, Sdprintf("%s: %s\n",
+				    end == '(' ? "FUNC" : "NAME",
+				    stringAtom(cur_token.value.atom)));
+
+		  break;
 		}
     case PU:	{ switch(c)
 		  { case '{':
-		    case '[': while(isBlank(*here) )
-				here++;
-			      if (here[0] == matchingBracket(c))
-			      { here++;
-				token.value.prolog =
-				    (word)(c == '[' ? ATOM_nil : ATOM_curl);
-				token.type = T_NAME;
-				DEBUG(9, printf("NAME: %s\n", stringAtom(token.value.prolog)));
-				return &token;
-			      }
-		  }
-		  token.value.character = c;
-		  token.type = T_PUNCTUATION;
-		  DEBUG(9, printf("PUNCT: %c\n", token.value.character));
-
-		  return &token;
-		}
-    case SQ:	{ char *s;
-
-		  start = here;
-		  for(s=start;;)
-		  { if (*here == '\'')
-		    { if (here[1] != '\'')
-		      { end = *s, *s = EOS;
-			token.value.prolog = (word) lookupAtom(start);
-			*s = end;
-			token.type = (here[1] == '(' ? T_FUNCTOR : T_NAME);
-			here++;
-			DEBUG(9, printf("%s: %s\n", here[1] == '(' ? "FUNC" : "NAME", stringAtom(token.value.prolog)));
-			return &token;
+		    case '[':
+		      while( isBlank(*rdhere) )
+			rdhere++;
+		      if (rdhere[0] == matchingBracket(c))
+		      { rdhere++;
+			cur_token.value.atom = (c == '[' ? ATOM_nil : ATOM_curl);
+			cur_token.type = rdhere[0] == '(' ? T_FUNCTOR : T_NAME;
+			PL_register_atom(cur_token.value.atom);
+			DEBUG(9, Sdprintf("NAME: %s\n",
+					  stringAtom(cur_token.value.atom)));
+			goto out;
 		      }
-		      here++;
-		    }
-		    *s++ = *here++;
 		  }
-		}
-    case DQ:	{ char *s;
+		  cur_token.value.character = c;
+		  cur_token.type = T_PUNCTUATION;
+		  DEBUG(9, Sdprintf("PUNCT: %c\n", cur_token.value.character));
 
-		  start = here;
-		  for(s=start;;)
-		  { if (*here == '"')
-		    { if (here[1] != '"')
-		      { end = *s, *s = EOS;
+		  break;
+		}
+    case SQ:	{ tmp_buffer b;
+		  int len;
+		  char *s;
+
+		  initBuffer(&b);
+		  get_string(rdhere-1, &rdhere, (Buffer)&b, _PL_rd);
+		  s = baseBuffer(&b, char);
+		  len = entriesBuffer(&b, char);
+		  cur_token.value.atom = lookupAtom(s, len);
+		  cur_token.type = (rdhere[0] == '(' ? T_FUNCTOR : T_NAME);
+		  discardBuffer(&b);
+		  break;
+		}
+    case DQ:	{ tmp_buffer b;
+		  term_t t = PL_new_term_ref();
+		  char *s;
+		  int len;
+
+		  initBuffer(&b);
+		  get_string(rdhere-1, &rdhere, (Buffer)&b, _PL_rd);
+		  s   = baseBuffer(&b, char);
+		  len = entriesBuffer(&b, char);
 #if O_STRING
-			if ( debugstatus.styleCheck & O_STRING_STYLE )
-			  token.value.prolog = globalString(start);
-			else
-			  token.value.prolog = (word) stringToList(start);
-#else
-			token.value.prolog = (word) stringToList(start);
-#endif /* O_STRING */
-			DEBUG(9, printf("STR: %s\n", start));
-			*s = end;
-			token.type = T_STRING;
-			here++;
-			return &token;
-		      }
-		      here++;
-		    }
-		    *s++ = *here++;
-		  }
+ 		  if ( true(_PL_rd, DBLQ_STRING) )
+		    PL_put_string_nchars(t, len, s);
+		  else
+#endif
+		  if ( true(_PL_rd, DBLQ_ATOM) )
+		    PL_put_atom_nchars(t, len, s);
+		  else if ( true(_PL_rd, DBLQ_CHARS) )
+		    PL_put_list_nchars(t, len, s);
+		  else
+		    PL_put_list_ncodes(t, len, s);
+
+  		  cur_token.value.term = t;
+		  cur_token.type = T_STRING;
+		  discardBuffer(&b);
+		  break;
 		}
     default:	{ sysError("read/1: tokeniser internal error");
-    		  return &token;	/* make lint happy */
+    		  break;		/* make lint happy */
 		}
   }
+
+out:
+  cur_token.end = source_char_no + rdhere - rdbase;
+
+  return &cur_token;
 }
 
+		 /*******************************
+		 *	   TERM-BUILDING	*
+		 *******************************/
+
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Build a term on the global stack, given the atom  of  the  functor,  the
-arity  and  a  vector of arguments.  The argument vector either contains
-nonvar terms or a reference to a variable block.
+Build a term on the global stack,  given   the  atom of the functor, the
+arity and a vector of  arguments.   The  argument vector either contains
+nonvar terms or a variable block. The latter looks like an atom (to make
+a possible invocation of the   garbage-collector or stack-shifter happy)
+and is recognised by  the  value   of  its  character-pointer,  which is
+statically allocated and thus unique.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-static word
-build_term(atom, arity, argv)
-Atom atom;
-int arity;
-Word argv;
-{ FunctorDef functor = lookupFunctorDef(atom, arity);
-  word term;
-  Word argp;
+#define setHandle(h, w)		(*valTermRef(h) = (w))
 
-  DEBUG(9, printf("Building term %s/%d ... ", stringAtom(atom), arity));
-  term = globalFunctor(functor);
-  argp = argTermP(term, 0);
-  while(arity-- > 0)
-  { if (isRef(*argv) )
-    { Variable var;
-#if O_NO_LEFT_CAST
-      Word w;
-      deRef2(argv, w);
-      var = (Variable) w;
-#else
-      deRef2(argv, (Word)var);
-#endif
-      if (var->address == (Word) NULL)
-	var->address = argp++;
-      else
-	*argp++ = makeRef(var->address);
-      argv++;
-    } else
-      *argp++ = *argv++;
-  }
-  DEBUG(9, printf("result: "); pl_write(&term); printf("\n") );
+static inline void
+readValHandle(term_t term, Word argp, ReadData _PL_rd)
+{ word w = *valTermRef(term);
+  Variable var;
 
-  return term;
+  if ( (var = isVarAtom(w, _PL_rd)) )
+  { DEBUG(9, Sdprintf("readValHandle(): var at 0x%x\n", var));
+
+    if ( !var->variable )		/* new variable */
+    { var->variable = PL_new_term_ref();
+      setVar(*argp);
+      *valTermRef(var->variable) = makeRef(argp);
+    } else				/* reference to existing var */
+    { *argp = *valTermRef(var->variable);
+    }
+  } else
+    *argp = w;				/* plain value */
+}
+
+
+static void
+build_term(term_t term, atom_t atom, int arity, term_t *argv, ReadData _PL_rd)
+{ functor_t functor = lookupFunctorDef(atom, arity);
+  Word argp = allocGlobal(arity+1);
+
+  DEBUG(9, Sdprintf("Building term %s/%d ... ", stringAtom(atom), arity));
+  setHandle(term, consPtr(argp, TAG_COMPOUND|STG_GLOBAL));
+  *argp++ = functor;
+
+  for( ; arity-- > 0; argv++, argp++)
+    readValHandle(*argv, argp, _PL_rd);
+
+  DEBUG(9, Sdprintf("result: "); pl_write(term); Sdprintf("\n") );
+}
+
+
+static void
+PL_assign_term(term_t to, term_t from)
+{ *valTermRef(to) = *valTermRef(from);
 }
 
 
@@ -1071,9 +1339,7 @@ Word argv;
 		*             PARSER            *
 		*********************************/
 
-#define priorityClash { syntaxError("Operator priority clash"); }
-
-#define MAX_TERM_NESTING 200
+#define priorityClash { syntaxError("operator_clash"); }
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 This part of the parser actually constructs  the  term.   It  calls  the
@@ -1083,29 +1349,41 @@ functions:  complex_term()  which is involved with operator handling and
 simple_term() which reads everything, except for operators.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+static bool
+simple_term(bool must_be_op, term_t term, bool *name,
+	    term_t positions,
+	    ReadData _PL_rd);
+
 typedef struct
-{ Atom	op;
-  int	kind;
-  int	left_pri;
-  int	right_pri;
-  int	op_pri;
+{ atom_t op;				/* Name of the operator */
+  short	kind;				/* kind (prefix/postfix/infix) */
+  short	left_pri;			/* priority at left-hand */
+  short	right_pri;			/* priority at right hand */
+  short	op_pri;				/* priority of operator */
+  term_t tpos;				/* term-position */
+  unsigned char *token_start;		/* start of the token for message */
 } op_entry;
 
-static bool
-isOp(atom, kind, e)
-Atom atom;
-int kind;
-op_entry *e;
-{ Operator op = isCurrentOperator(atom, kind);
-  int pri;
 
-  if ( op == NULL )
+typedef struct
+{ term_t term;				/* the term */
+  term_t tpos;				/* its term-position */
+  int	 pri;				/* priority of the term */
+} out_entry;
+
+
+static bool
+isOp(atom_t atom, int kind, op_entry *e, ReadData _PL_rd)
+{ int pri;
+  int type;
+
+  if ( !currentOperator(_PL_rd->module, atom, kind, &type, &pri) )
     fail;
   e->op     = atom;
   e->kind   = kind;
-  e->op_pri = pri = op->priority;
+  e->op_pri = pri;
 
-  switch(op->type)
+  switch(type)
   { case OP_FX:		e->left_pri = 0;     e->right_pri = pri-1; break;
     case OP_FY:		e->left_pri = 0;     e->right_pri = pri;   break;
     case OP_XF:		e->left_pri = pri-1; e->right_pri = 0;     break;
@@ -1119,63 +1397,234 @@ op_entry *e;
   succeed;
 }
 
-#define PushOp() \
-	side[side_n++] = in_op; \
-	if ( side_n >= MAX_TERM_NESTING ) \
-	  syntaxError("Operator stack overflow"); \
-	side_p = (side_n == 1 ? side : side_p+1);
-	
-#define Modify(pri) \
-	if ( side_p != NULL && pri > side_p->right_pri ) \
-	{ if ( side_p->kind == OP_PREFIX && rmo == 0 ) \
-	  { DEBUG(1, printf("Prefix %s to atom\n", stringAtom(side_p->op))); \
-	    rmo++; \
-	    out[out_n++] = (word) side_p->op; \
-	    side_n--; \
-	    side_p = (side_n == 0 ? NULL : side_p-1); \
-	  } else if ( side_p->kind == OP_INFIX && out_n > 0 && rmo == 0 && \
-		      isOp(side_p->op, OP_POSTFIX, side_p) ) \
-	  { DEBUG(1, printf("Infix %s to postfix\n", stringAtom(side_p->op)));\
-	    rmo++; \
-	    out[out_n-1] = build_term(side_p->op, 1, &out[out_n-1]); \
-	    side_n--; \
-	    side_p = (side_n == 0 ? NULL : side_p-1); \
+static void
+build_op_term(term_t term,
+	      atom_t atom, int arity, out_entry *argv,
+	      ReadData _PL_rd)
+{ term_t av[2];
+
+  av[0] = argv[0].term;
+  av[1] = argv[1].term;
+  build_term(term, atom, arity, av, _PL_rd);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+realloca() maintains a buffer using  alloca()   that  has  the requested
+size. The current size is maintained in   a long just below the returned
+area. This is a long, to ensure   proper  allignment of the remainder of
+the values.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#define realloca(p, unit, n) \
+	{ long *ip = (long *)(p); \
+	  if ( ip == NULL || ip[-1] < (n) ) \
+	  { long nsize = (((n)+(n)/2) + 3) & ~3; \
+	    long *np = alloca(nsize * unit + sizeof(long)); \
+	    *np++ = nsize; \
+	    if ( ip ) \
+	      memcpy(np, ip, ip[-1] * unit); \
+	    p = (void *)np; \
 	  } \
 	}
 
-#define Reduce(cond) \
-	while( out_n > 0 && side_p != NULL && (cond) ) \
-	{ int arity = (side_p->kind == OP_INFIX ? 2 : 1); \
-							  \
-	  DEBUG(1, printf("Reducing %s/%d\n", stringAtom(side_p->op), arity));\
-	  out[out_n-arity] = build_term(side_p->op, \
-					arity, \
-					&out[out_n - arity]); \
-	  out_n -= (arity-1); \
-	  side_n--; \
-	  side_p = (side_n == 0 ? NULL : side_p-1); \
+#define PushOp() \
+	realloca(side, sizeof(*side), side_n+1); \
+	side[side_n++] = in_op; \
+	side_p = (side_n == 1 ? 0 : side_p+1);
+	
+#define Modify(cpri) \
+	if ( side_p >= 0 && cpri > side[side_p].right_pri ) \
+	{ term_t tmp; \
+	  if ( side[side_p].kind == OP_PREFIX && rmo == 0 ) \
+	  { DEBUG(9, Sdprintf("Prefix %s to atom\n", \
+			      stringAtom(side[side_p].op))); \
+	    rmo++; \
+	    tmp = PL_new_term_ref(); \
+	    PL_put_atom(tmp, side[side_p].op); \
+	    realloca(out, sizeof(*out), out_n+1); \
+	    out[out_n].term = tmp; \
+	    out[out_n].tpos = side[side_p].tpos; \
+	    out[out_n].pri = 0; \
+	    out_n++; \
+	    side_n--; \
+	    side_p = (side_n == 0 ? -1 : side_p-1); \
+	  } else if ( side[side_p].kind == OP_INFIX && out_n > 0 && rmo == 0 && \
+		      isOp(side[side_p].op, OP_POSTFIX, &side[side_p], _PL_rd) ) \
+	  { DEBUG(9, Sdprintf("Infix %s to postfix\n", \
+			      stringAtom(side[side_p].op))); \
+	    rmo++; \
+	    tmp = PL_new_term_ref(); \
+	    build_op_term(tmp, side[side_p].op, 1, &out[out_n-1], _PL_rd); \
+	    out[out_n-1].pri  = side[side_p].op_pri; \
+	    out[out_n-1].term = tmp; \
+	    side[side_p].kind = OP_POSTFIX; \
+	    out[out_n-1].tpos = opPos(&side[side_p], &out[out_n-1]); \
+	    side_n--; \
+	    side_p = (side_n == 0 ? -1 : side_p-1); \
+	  } \
 	}
 
 
+static int
+get_int_arg(term_t t, int n)
+{ Word p = valTermRef(t);
+
+  deRef(p);
+
+  return valInt(argTerm(*p, n-1));
+}
+
+
+static term_t
+opPos(op_entry *op, out_entry *args)
+{ if ( op->tpos )
+  { int fs = get_int_arg(op->tpos, 1);
+    int fe = get_int_arg(op->tpos, 2);
+    term_t r = PL_new_term_ref();
+
+    if ( op->kind == OP_INFIX )
+    { int s = get_int_arg(args[0].tpos, 1);
+      int e = get_int_arg(args[1].tpos, 2);
+
+      PL_unify_term(r,
+		    PL_FUNCTOR,	FUNCTOR_term_position5,
+		    PL_INT, s,
+		    PL_INT, e,
+		    PL_INT, fs,
+		    PL_INT, fe,
+		    PL_LIST, 2, PL_TERM, args[0].tpos,
+		    		PL_TERM, args[1].tpos);
+    } else
+    { int s, e;
+      
+      if ( op->kind == OP_PREFIX )
+      { s = fs;
+	e = get_int_arg(args[0].tpos, 2);
+      } else
+      { s = get_int_arg(args[0].tpos, 1);
+	e = fe;
+      }
+
+      PL_unify_term(r,
+		    PL_FUNCTOR,	FUNCTOR_term_position5,
+		    PL_INT, s,
+		    PL_INT, e,
+		    PL_INT, fs,
+		    PL_INT, fe,
+		    PL_LIST, 1, PL_TERM, args[0].tpos);
+    }
+    
+    return r;
+  }
+
+  return 0;
+}
+
+
+static int
+can_reduce(out_entry *out, op_entry *op)
+{ int rval;
+
+  switch(op->kind)
+  { case OP_PREFIX:
+      rval = op->right_pri >= out[0].pri;
+      break;
+    case OP_POSTFIX:
+      rval = op->left_pri >= out[0].pri;
+      break;
+    case OP_INFIX:
+      rval = op->left_pri >= out[0].pri &&
+	     op->right_pri >= out[1].pri;
+      break;
+    default:
+      assert(0);
+      rval = FALSE;
+  }
+
+  return rval;
+}
+
+static int
+bad_operator(out_entry *out, op_entry *op, ReadData _PL_rd)
+{ /*term_t t;*/
+  char *opname = stringAtom(op->op);
+
+  last_token_start = op->token_start;
+
+  switch(op->kind)
+  { case OP_INFIX:
+      if ( op->left_pri < out[0].pri )
+      { /*t = out[0].term;*/
+	;
+      } else
+      { last_token_start += strlen(opname);
+	/*t = out[1].term;*/
+      }
+      break;
+    case OP_PREFIX:
+      last_token_start += strlen(opname);
+      /*FALL THROUGH*/
+    default:
+      /*t = out[0].term;*/
+      ;
+  }
+
+/* might use this to improve the error message!?
+  if ( PL_get_name_arity(t, &name, &arity) )
+  { Ssprintf(buf, "Operator `%s' conflicts with `%s'",
+	     opname, stringAtom(name));
+  }
+*/
+
+  syntaxError("operator_clash", _PL_rd);
+}
+
+#define Reduce(cpri) \
+	while( out_n > 0 && side_p >= 0 && (cpri) >= side[side_p].op_pri ) \
+	{ int arity = (side[side_p].kind == OP_INFIX ? 2 : 1); \
+	  term_t tmp; \
+	  if ( arity > out_n ) break; \
+	  if ( !can_reduce(&out[out_n-arity], &side[side_p]) ) \
+          { if ( (cpri) == (OP_MAXPRIORITY+1) ) \
+              return bad_operator(&out[out_n-arity], &side[side_p], _PL_rd); \
+	    break; \
+	  } \
+	  DEBUG(9, Sdprintf("Reducing %s/%d\n", \
+			    stringAtom(side[side_p].op), arity));\
+	  tmp = PL_new_term_ref(); \
+	  out_n -= arity; \
+	  build_op_term(tmp, side[side_p].op, arity, &out[out_n], _PL_rd); \
+	  out[out_n].pri  = side[side_p].op_pri; \
+	  out[out_n].term = tmp; \
+	  out[out_n].tpos = opPos(&side[side_p], &out[out_n]); \
+	  out_n ++; \
+	  side_n--; \
+	  side_p = (side_n == 0 ? -1 : side_p-1); \
+	}
 
 
 static bool
-complex_term(stop, term)
-char *stop;
-Word term;
-{ word out[MAX_TERM_NESTING];
-  op_entry in_op, side[MAX_TERM_NESTING];
+complex_term(const char *stop, term_t term, term_t positions, ReadData _PL_rd)
+{ out_entry *out  = NULL;
+  op_entry  *side = NULL;
+  op_entry  in_op;
   int out_n = 0, side_n = 0;
   int rmo = 0;				/* Rands more than operators */
-  op_entry *side_p = NULL;
+  int side_p = -1;
+  term_t pin;
 
   for(;;)
   { bool isname;
     Token token;
-    word in;
+    term_t in = PL_new_term_ref();
 
+    if ( positions )
+      pin = PL_new_term_ref();
+    else
+      pin = 0;
+  
     if ( out_n != 0 || side_n != 0 )	/* Check for end of term */
-    { if ( (token = get_token(rmo == 1)) == (Token) NULL )
+    { if ( !(token = get_token(rmo == 1, _PL_rd)) )
 	fail;
       unget_token();			/* only look-ahead! */
 
@@ -1185,39 +1634,50 @@ Word term;
 	    goto exit;
 	  break;
 	case T_PUNCTUATION:
-	{ if ( stop != NULL && index(stop, token->value.character) )
+	{ if ( stop != NULL && strchr(stop, token->value.character) )
 	    goto exit;
 	}
       }
     }
 
 					/* Read `simple' term */
-    TRY( simple_term(rmo == 1, &in, &isname) );
+    TRY( simple_term(rmo == 1, in, &isname, pin, _PL_rd) );
 
     if ( isname )			/* Check for operators */
-    { if ( rmo == 1 && isOp((Atom) in, OP_INFIX, &in_op) )
-      {	DEBUG(1, printf("Infix op: %s\n", stringAtom((Atom) in)));
+    { atom_t name;
+
+      PL_get_atom(in, &name);
+      in_op.tpos = pin;
+      in_op.token_start = last_token_start;
+
+      DEBUG(9, Sdprintf("name %s, rmo = %d\n", stringAtom(name), rmo));
+
+      if ( isOp(name, OP_INFIX, &in_op, _PL_rd) )
+      { DEBUG(9, Sdprintf("Infix op: %s\n", stringAtom(name)));
 
 	Modify(in_op.left_pri);
-	Reduce(in_op.left_pri > side_p->right_pri);
-	PushOp();
-	rmo--;
+	if ( rmo == 1 )
+	{ Reduce(in_op.left_pri);
+	  PushOp();
+	  rmo--;
 
-	continue;
+	  continue;
+	}
       }
-      if ( rmo == 1 && isOp((Atom) in, OP_POSTFIX, &in_op) )
-      { DEBUG(1, printf("Postfix op: %s\n", stringAtom((Atom) in)));
+      if ( isOp(name, OP_POSTFIX, &in_op, _PL_rd) )
+      { DEBUG(9, Sdprintf("Postfix op: %s\n", stringAtom(name)));
 
 	Modify(in_op.left_pri);
-	Reduce(in_op.left_pri > side_p->right_pri);
-	PushOp();	
+	if ( rmo == 1 )
+	{ Reduce(in_op.left_pri);
+	  PushOp();	
 	
-	continue;
+	  continue;
+	}
       }
-      if ( rmo == 0 && isOp((Atom) in, OP_PREFIX, &in_op) )
-      { DEBUG(1, printf("Prefix op: %s\n", stringAtom((Atom) in)));
+      if ( rmo == 0 && isOp(name, OP_PREFIX, &in_op, _PL_rd) )
+      { DEBUG(9, Sdprintf("Prefix op: %s\n", stringAtom(name)));
 	
-	Reduce(in_op.left_pri > side_p->right_pri);
 	PushOp();
 
 	continue;
@@ -1225,147 +1685,245 @@ Word term;
     }
 
     if ( rmo != 0 )
-      syntaxError("Operator expected");
+      syntaxError("operator_expected", _PL_rd);
     rmo++;
-    out[out_n++] = in;
-    if	( out_n >= MAX_TERM_NESTING )
-      syntaxError("Operant stack overflow");
+    realloca(out, sizeof(*out), out_n+1);
+    out[out_n].pri = 0;
+    out[out_n].term = in;
+    out[out_n++].tpos = pin;
   }
 
 exit:
-  Modify(1000000);
-  Reduce(TRUE);
+  Modify(OP_MAXPRIORITY+1);
+  Reduce(OP_MAXPRIORITY+1);
 
   if ( out_n == 1 && side_n == 0 )	/* simple term */
-  { *term = out[0];
+  { PL_assign_term(term, out[0].term);
+    if ( positions )
+      PL_unify(positions, out[0].tpos);
     succeed;
   }
 
   if ( out_n == 0 && side_n == 1 )	/* single operator */
-  { *term = (word) side[0].op;
+  { PL_put_atom(term, side[0].op);
+    if ( positions )
+      PL_unify(positions, side[0].tpos);
     succeed;
   }
 
-  syntaxError("Unbalanced operators");
+  syntaxError("operator_balance", _PL_rd);
 }
 
 
 static bool
-simple_term(must_be_op, term, name)
-bool must_be_op;
-Word term;
-bool *name;
-{ Token token;
-
-  DEBUG(9, printf("simple_term(): Stack at %ld\n", &term));
+simple_term(bool must_be_op, term_t term, bool *name,
+	    term_t positions, ReadData _PL_rd)
+{ GET_LD
+#undef LD
+#define LD LOCAL_LD
+  Token token;
 
   *name = FALSE;
 
-  if ( (token = get_token(must_be_op)) == NULL )
+  if ( !(token = get_token(must_be_op, _PL_rd)) )
     fail;
 
   switch(token->type)
   { case T_FULLSTOP:
-      syntaxError("Unexpected end of clause");
+      syntaxError("end_of_clause", _PL_rd);
     case T_VOID:
-      { *term = token->value.prolog;
-	succeed;
-      }
+      setHandle(term, 0L);		/* variable */
+      goto atomic_out;
     case T_VARIABLE:
-      { *term = makeRef(token->value.variable);
-	succeed;
-      }
+      setHandle(term, token->value.variable->signature);
+      DEBUG(9, Sdprintf("Pushed var at 0x%x\n", token->value.variable));
+      goto atomic_out;
     case T_NAME:
       *name = TRUE;
-    case T_REAL:
-    case T_INTEGER:
-    case T_STRING:
-      {	*term = token->value.prolog;
-	succeed;
+      PL_put_atom(term, token->value.atom);
+      PL_unregister_atom(token->value.atom);
+      goto atomic_out;
+    case T_NUMBER:
+      _PL_put_number(term, &token->value.number);
+    atomic_out:
+      if ( positions )
+      { PL_unify_term(positions,
+		      PL_FUNCTOR, FUNCTOR_minus2,
+		      PL_LONG, token->start,
+		      PL_LONG, token->end);
       }
+      succeed;
+    case T_STRING:
+      PL_put_term(term,	token->value.term);
+      if ( positions )
+      { PL_unify_term(positions,
+		      PL_FUNCTOR, FUNCTOR_string_position2,
+		      PL_LONG, token->start,
+		      PL_LONG, token->end);
+      }
+      succeed;
     case T_FUNCTOR:
       { if ( must_be_op )
 	{ *name = TRUE;
-	  *term = token->value.prolog;
+	  PL_put_atom(term, token->value.atom);
+	  PL_unregister_atom(token->value.atom);
 	} else
-	{ word argv[MAXARITY+1];
+	{ term_t av[16];
+	  int avn = 16;
+	  term_t *argv = av;
 	  int argc;
-	  Word argp;
-	  word functor;
+	  atom_t functor;
+	  term_t pa;			/* argument */
+	  term_t pe;			/* term-end */
+	  term_t ph;
 
-	  functor = token->value.prolog;
-	  argc = 0, argp = argv;
-	  get_token(must_be_op);	/* skip '(' */
+	  if ( positions )
+	  { pa = PL_new_term_ref();
+	    pe = PL_new_term_ref();
+	    ph = PL_new_term_ref();
+	    PL_unify_term(positions,
+			  PL_FUNCTOR, FUNCTOR_term_position5,
+			  PL_LONG, token->start,
+			  PL_TERM, pe,
+			  PL_LONG, token->start,
+			  PL_LONG, token->end,
+			  PL_TERM, pa);
+	  } else
+	    pa = pe = ph = 0;
+
+	  functor = token->value.atom;
+	  argc = 0, argv;
+	  get_token(must_be_op, _PL_rd); /* skip '(' */
 
 	  do
-	  { TRY( complex_term(",)", argp++) );
-	    if (++argc > MAXARITY)
-	      syntaxError("Arity too high");
-	    token = get_token(must_be_op); /* `,' or `)' */
+	  { if ( argc == avn )
+	    { term_t *nargv = alloca(sizeof(term_t) * avn * 2);
+	      memcpy(nargv, argv, sizeof(term_t) * avn);
+	      avn *= 2;
+	      argv = nargv;
+	    }
+	    argv[argc] = PL_new_term_ref();
+	    if ( positions )
+	    { PL_unify_list(pa, ph, pa);
+	    }
+	    TRY( complex_term(",)", argv[argc], ph, _PL_rd) );
+	    argc++;
+	    token = get_token(must_be_op, _PL_rd); /* `,' or `)' */
 	  } while(token->value.character == ',');
 
-	  *term = build_term((Atom)functor, argc, argv);
+	  if ( positions )
+	  { PL_unify_integer(pe, token->end);
+	    PL_unify_nil(pa);
+	  }
+
+	  build_term(term, functor, argc, argv, _PL_rd);
+	  PL_unregister_atom(functor);
 	}
 	succeed;
       }
     case T_PUNCTUATION:
       { switch(token->value.character)
 	{ case '(':
-	    { word arg;
+	    { int start = token->start;
 
-	      TRY( complex_term(")", &arg) );
-	      token = get_token(must_be_op);	/* skip ')' */
-	      *term = arg;
+	      TRY( complex_term(")", term, positions, _PL_rd) );
+	      token = get_token(must_be_op, _PL_rd);	/* skip ')' */
+
+	      if ( positions )
+	      { Word p = argTermP(*valTermRef(positions), 0);
+
+		*p++ = consInt(start);
+		*p   = consInt(token->end);
+	      }
 
 	      succeed;
 	    }
 	  case '{':
-	    { word arg;
+	    { term_t arg = PL_new_term_ref();
+	      term_t pa, pe;
 
-	      TRY( complex_term("}", &arg) );
-	      token = get_token(must_be_op);
-	      *term = build_term(ATOM_curl, 1, &arg);
+	      if ( positions )
+	      { pa = PL_new_term_ref();
+		pe = PL_new_term_ref();
+
+		PL_unify_term(positions,
+			      PL_FUNCTOR, FUNCTOR_brace_term_position3,
+			      PL_LONG, token->start,
+			      PL_TERM, pe,
+			      PL_TERM, pa);
+	      } else
+		pe = pa = 0;
+
+	      TRY( complex_term("}", arg, pa, _PL_rd) );
+	      token = get_token(must_be_op, _PL_rd);
+	      if ( positions )
+		PL_unify_integer(pe, token->end);
+	      build_term(term, ATOM_curl, 1, &arg, _PL_rd);
 
 	      succeed;
 	    }
 	  case '[':
-	    { Word tail = term;
-	      word arg[2];
-	      Atom dot = ATOM_dot;
+	    { term_t tail = PL_new_term_ref();
+	      term_t tmp  = PL_new_term_ref();
+	      term_t pa, pe, pt, p2;
+
+	      if ( positions )
+	      { pa = PL_new_term_ref();
+		pe = PL_new_term_ref();
+		pt = PL_new_term_ref();
+		p2 = PL_new_term_ref();
+
+		PL_unify_term(positions,
+			      PL_FUNCTOR, FUNCTOR_list_position4,
+			      PL_LONG, token->start,
+			      PL_TERM, pe,
+			      PL_TERM, pa,
+			      PL_TERM, pt);
+	      } else
+		pa = pe = p2 = pt = 0;
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Reading a list. Tmp is used to  read   the  next element. Tail is a very
+special term-ref. It is always a reference   to the place where the next
+term is to be written.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+	      PL_put_term(tail, term);
 
 	      for(;;)
-	      { TRY( complex_term(",|]", &arg[0]) );
+	      { Word argp;
 
-		arg[1] = (word) NULL;
-		*tail = build_term(dot, 2, arg);
-		tail = argTermP(*tail, 1);
-		token = get_token(must_be_op);
+		if ( positions )
+		  PL_unify_list(pa, p2, pa);
+		TRY( complex_term(",|]", tmp, p2, _PL_rd) );
+		argp = allocGlobal(3);
+		*unRef(*valTermRef(tail)) = consPtr(argp,
+						    TAG_COMPOUND|STG_GLOBAL);
+		*argp++ = FUNCTOR_dot2;
+		readValHandle(tmp, argp++, _PL_rd);
+		setVar(*argp);
+		setHandle(tail, makeRef(argp));
+		
+		token = get_token(must_be_op, _PL_rd);
 
 		switch(token->value.character)
 		{ case ']':
-		    { *tail = (word) ATOM_nil;
-		      succeed;
+		    { if ( positions )
+		      { PL_unify_nil(pa);
+			PL_unify_atom(pt, ATOM_none);
+			PL_unify_integer(pe, token->end);
+		      }
+		      return PL_unify_nil(tail);
 		    }
 		  case '|':
-		    { TRY( complex_term("]", &arg[0]) );
-
-		      if (isRef(arg[0]))
-		      { Variable var;
-#if O_NO_LEFT_CAST
-			Word w;
-			deRef2(&arg[0], w);
-			var = (Variable) w;
-#else
-			deRef2(&arg[0], (Word)var);
-#endif
-			if (var->address == (Word) NULL)
-			  var->address = tail;
-			else
-			  *tail = makeRef(var->address);
-		      } else
-			*tail = arg[0];
-
-		      token = get_token(must_be_op);
+		    { TRY( complex_term("]", tmp, pt, _PL_rd) );
+		      argp = unRef(*valTermRef(tail));
+		      readValHandle(tmp, argp, _PL_rd);
+		      token = get_token(must_be_op, _PL_rd); /* discard ']' */
+		      if ( positions )
+		      { PL_unify_nil(pa);
+			PL_unify_integer(pe, token->end);
+		      }
 		      succeed;
 		    }
 		  case ',':
@@ -1373,21 +1931,15 @@ bool *name;
 		}
 	      }
 	    }
-	  case '|':
 	  case ',':
+	  case '|':
 	  case ')':
 	  case '}':
 	  case ']':
 	  default:
-	    { char tmp[2];
-
-	      *name = TRUE; 
-	      tmp[0] = token->value.character;
-	      tmp[1] = EOS;
-	      *term = (word) lookupAtom(tmp);
-
-	      succeed;
-	    }
+	    *name = TRUE;
+	    PL_put_atom(term, codeToAtom(token->value.character));
+	    goto atomic_out;
 	}
       } /* case T_PUNCTUATION */
     default:;
@@ -1395,52 +1947,71 @@ bool *name;
       /*NOTREACHED*/
       fail;
   }
+#undef LD
+#define LD GLOBAL_LD
 }
 
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+read_term(?term, ReadData rd)
+    Common part of all read variations. Please note that the
+    variable-handling code uses terms of the type STG_GLOBAL|TAG_ATOM,
+    which are not valid Prolog terms. Some of the temporary
+    term-references will even be initialised to this data after
+    read has completed.  Hence the PL_reset_term_refs() in this
+    function, which not only saves memory, but also guarantees the
+    stacks are in a sane state after read has completed.
+
+    Should one ever think of it, the garbage collector cannot be
+    activated during read for this reason, unless it is programmed
+    to deal with this intermediate type! We actually block GC, as
+    errors and interrupts may cause Prolog to become active with
+    these terms around.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
 static bool
-read_term(term, variables, check)
-Word term, variables;
-bool check;
+read_term(term_t term, ReadData rd)
 { Token token;
-  word result;
+  term_t result;
+  Word p;
 
-  if ((base = raw_read()) == (char *) NULL)
+  if ( !(rd->base = raw_read(rd)) )
     fail;
 
-  initVarTable();
-  here = base;
-  unget = FALSE;
+  rd->here = rd->base;
 
-  TRY( complex_term(NULL, &result) );
+  result = PL_new_term_ref();
+  blockGC();
+  if ( !complex_term(NULL, result, rd->subtpos, rd) )
+    goto failed;
+  p = valTermRef(result);
+  if ( isVarAtom(*p, rd) )		/* reading a single variable */
+    readValHandle(result, p, rd);
 
-  if ((token = get_token(FALSE)) == (Token) NULL)
-    fail;
-  if (token->type != T_FULLSTOP)
-    syntaxError("End of clause expected");
-
-  if ( isRef(result) )	/* term is a single variable! */
-  { Variable var;
-#if O_NO_LEFT_CAST
-    Word w;
-    deRef2(&result, w);
-    var = (Variable) w;
-#else
-    deRef2(&result, (Word)var);
-#endif
-    if ( var->times != 1 || var->address != (Word)NULL )
-      sysError("Error while reading a single variable??");
-    var->address = allocGlobal(sizeof(word));
-    setVar(*var->address);
-    result = makeRef(var->address);
+  if ( !(token = get_token(FALSE, rd)) )
+    goto failed;
+  if ( token->type != T_FULLSTOP )
+  { errorWarning("end_of_clause_expected", rd);
+    goto failed;
   }
 
-  TRY(pl_unify(term, &result) );
-  if (variables != (Word) NULL)
-    TRY(bind_variables(variables) );
-  if (check)
-    check_singletons();
+  if ( !PL_unify(term, result) )
+    goto failed;
+  if ( rd->varnames && !bind_variable_names(rd) )
+    goto failed;
+  if ( rd->variables && !bind_variables(rd) )
+    goto failed;
+  if ( rd->singles && !check_singletons(rd) )
+    goto failed;
 
+  PL_reset_term_refs(result);
+  unblockGC();
   succeed;
+
+failed:
+  PL_reset_term_refs(result);
+  unblockGC();
+  fail;
 }
 
 		/********************************
@@ -1448,59 +2019,264 @@ bool check;
 		*********************************/
 
 word
-pl_raw_read(term)
-Word term;
-{ char *s;
-  register char *top;
+pl_raw_read2(term_t from, term_t term)
+{ unsigned char *s, *top;
+  read_data rd;
+  word rval;
+  IOSTREAM *in;
 
-  s = raw_read();
-
-  if ( s == (char *) NULL )
+  if ( !getInputStream(from, &in) )
     fail;
-  
-  for(top = s+strlen(s)-1; isBlank(*top); top--);
-  if (*top == '.')
-    *top = EOS;
-  for(; isBlank(*s); s++);
 
-  return unifyAtomic(term, lookupAtom(s) );
+  init_read_data(&rd, in);
+  if ( !(s = raw_read(&rd)) )
+  { rval = PL_raise_exception(rd.exception);
+    goto out;
+  }
+
+					/* strip the input from blanks */
+  for(top = rd._rb.here-1; top > s && isBlank(*top); top--);
+  if ( *top == '.' )
+  { for(top--; top > s && isBlank(*top); top--)
+      ;
+  }
+  *++top = EOS;
+
+  for(; s < top && isBlank(*s); s++)
+    ;
+
+  rval = PL_unify_atom_nchars(term, top-s, (char *)s);
+
+out:
+  PL_release_stream(in);
+  free_read_data(&rd);
+
+  return rval;
+}
+
+
+word
+pl_raw_read(term_t term)
+{ return pl_raw_read2(0, term);
+}
+
+
+word
+pl_read2(term_t from, term_t term)
+{ read_data rd;
+  int rval;
+  IOSTREAM *s;
+
+  if ( !getInputStream(from, &s) )
+    fail;
+
+  init_read_data(&rd, s);
+  rval = read_term(term, &rd);
+  if ( rd.has_exception )
+    rval = PL_raise_exception(rd.exception);
+  free_read_data(&rd);
+  PL_release_stream(s);
+
+  return rval;
+}
+
+
+word
+pl_read(term_t term)
+{ return pl_read2(0, term);
+}
+
+
+word
+pl_read_clause2(term_t from, term_t term)
+{ read_data rd;
+  int rval;
+  IOSTREAM *s;
+  mark m;
+
+retry:
+  Mark(m);
+
+  if ( !getInputStream(from, &s) )
+    fail;
+
+  init_read_data(&rd, s);
+  rd.on_error = ATOM_dec10;
+  rd.singles = debugstatus.styleCheck & SINGLETON_CHECK ? TRUE : FALSE;
+  if ( !(rval = read_term(term, &rd)) && rd.has_exception )
+  { if ( reportReadError(&rd) )
+    { Undo(m);
+      free_read_data(&rd);
+      goto retry;
+    }
+  }
+  free_read_data(&rd);
+  PL_release_stream(s);
+
+  return rval;
 }
 
 word
-pl_read_variables(term, variables)
-Word term, variables;
-{ return read_term(term, variables, FALSE);
+pl_read_clause(term_t term)
+{ return pl_read_clause2(0, term);
+}
+
+static const opt_spec read_term_options[] = 
+{ { ATOM_variable_names,    OPT_TERM },
+  { ATOM_variables,         OPT_TERM },
+  { ATOM_singletons,        OPT_TERM },
+  { ATOM_term_position,     OPT_TERM },
+  { ATOM_subterm_positions, OPT_TERM },
+  { ATOM_character_escapes, OPT_BOOL },
+  { ATOM_double_quotes,	    OPT_ATOM },
+  { ATOM_module,	    OPT_ATOM },
+  { ATOM_syntax_errors,     OPT_ATOM },
+  { NULL_ATOM,	     	    0 }
+};
+
+word
+pl_read_term3(term_t from, term_t term, term_t options)
+{ term_t tpos = 0;
+  int rval;
+  atom_t w;
+  read_data rd;
+  IOSTREAM *s;
+  bool charescapes = -1;
+  atom_t dq = NULL_ATOM;
+  atom_t mname = NULL_ATOM;
+  mark m;
+
+retry:
+  Mark(m);
+
+  if ( !getInputStream(from, &s) )
+    fail;
+  init_read_data(&rd, s);
+
+  if ( !scan_options(options, 0, ATOM_read_option, read_term_options,
+		     &rd.varnames,
+		     &rd.variables,
+		     &rd.singles,
+		     &tpos,
+		     &rd.subtpos,
+		     &charescapes,
+		     &dq,
+		     &mname,
+		     &rd.on_error) )
+  { PL_release_stream(s);
+    fail;
+  }
+
+  if ( mname )
+  { rd.module = lookupModule(mname);
+    rd.flags  = rd.module->flags;
+  } 
+
+  if ( charescapes != -1 )
+  { if ( charescapes )
+      set(&rd, CHARESCAPE);
+    else
+      clear(&rd, CHARESCAPE);
+  }
+  if ( dq )
+  { if ( !setDoubleQuotes(dq, &rd.flags) )
+    { PL_release_stream(s);
+      fail;
+    }
+  }
+  if ( rd.singles && PL_get_atom(rd.singles, &w) && w == ATOM_warning )
+    rd.singles = TRUE;
+
+  rval = read_term(term, &rd);
+  PL_release_stream(s);
+
+  if ( rval )
+  { if ( tpos && source_line_no > 0 )
+      rval = PL_unify_term(tpos,
+			   PL_FUNCTOR, FUNCTOR_stream_position3,
+			   PL_LONG, source_char_no,
+			   PL_INT,  source_line_no,
+			   PL_INT,  0); /* should be charpos! */
+  } else
+  { if ( rd.has_exception && reportReadError(&rd) )
+    { Undo(m);
+      free_read_data(&rd);
+      goto retry;
+    }
+  }
+
+  free_read_data(&rd);
+
+  return rval;
 }
 
 word
-pl_read_variables3(stream, term, variables)
-Word stream, term, variables;
-{ streamInput(stream, pl_read_variables(term, variables));
+pl_read_term(term_t term, term_t options)
+{ return pl_read_term3(0, term, options);
 }
+
+		 /*******************************
+		 *	   TERM <->ATOM		*
+		 *******************************/
 
 word
-pl_read(term)
-Word term;
-{ return read_term(term, (Word)NULL, FALSE);
+pl_atom_to_term(term_t atom, term_t term, term_t bindings)
+{ char *s;
+
+  if ( PL_is_variable(atom) )
+  { char buf[1024];
+    int bufsize = sizeof(buf);
+    word rval;
+
+    s = buf;
+    tellString(&s, &bufsize);
+    pl_writeq(term);
+    toldString();
+
+    rval = PL_unify_atom_nchars(atom, bufsize-1, s);
+    if ( s != buf )
+      free(s);
+
+    return rval;
+  }
+
+  if ( PL_get_chars(atom, &s, CVT_ALL) )
+  { read_data rd;
+    word rval;
+    IOSTREAM *stream = Sopen_string(NULL, (char *)s, -1, "r");
+    source_location oldsrc = LD->read_source;
+
+    init_read_data(&rd, stream);
+    if ( PL_is_variable(bindings) || PL_is_list(bindings) )
+      rd.varnames = bindings;
+
+    if ( !(rval = read_term(term, &rd)) && rd.has_exception )
+      rval = PL_raise_exception(rd.exception);
+    free_read_data(&rd);
+    Sclose(stream);
+    LD->read_source = oldsrc;
+
+    return rval;
+  }
+
+  return PL_error("term_to_atom", 2, NULL, ERR_INSTANTIATION);
 }
 
-word
-pl_read2(stream, term)
-Word stream, term;
-{ streamInput(stream, pl_read(term));
+
+int
+PL_chars_to_term(const char *s, term_t t)
+{ read_data rd;
+  int rval;
+  IOSTREAM *stream = Sopen_string(NULL, (char *)s, -1, "r");
+  source_location oldsrc = LD->read_source;
+    
+  init_read_data(&rd, stream);
+  PL_put_variable(t);
+  if ( !(rval = read_term(t, &rd)) && rd.has_exception )
+    PL_put_term(t, rd.exception);
+  free_read_data(&rd);
+  Sclose(stream);
+  LD->read_source = oldsrc;
+
+  return rval;
 }
-
-word
-pl_read_clause(term)
-Word term;
-{ return read_term(term, (Word) NULL,
-		   debugstatus.styleCheck & SINGLETON_CHECK ? TRUE : FALSE);
-}
-
-word
-pl_read_clause2(stream, term)
-Word stream, term;
-{ streamInput(stream, pl_read_clause(term));
-}
-
-

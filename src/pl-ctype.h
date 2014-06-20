@@ -1,32 +1,37 @@
-/*  pl-ctype.h,v 1.1.1.1 1992/05/26 11:52:16 jan Exp
+/*  $Id: pl-ctype.h,v 1.6 2000/04/06 09:30:24 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Character types
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
-extern char char_type[];	/* array of character types */
+extern char _PL_char_types[];	/* array of character types */
 
-#define SP  0			/* space */
-#define SO  1			/* solo character */
-#define SY  2			/* symbol character */
-#define PU  3			/* Punctuation character */
-#define DQ  4			/* Double quote */
-#define SQ  5			/* Single quote */
-#define UC  6			/* Uppercase character */
-#define LC  7			/* Lowercase character */
-#define DI  8			/* Digit */
+#define CT  0			/* control-character */
+#define SP  1			/* space */
+#define SO  2			/* solo character */
+#define SY  3			/* symbol character */
+#define PU  4			/* Punctuation character */
+#define DQ  5			/* Double quote */
+#define SQ  6			/* Single quote */
+#define UC  7			/* Uppercase character */
+#define LC  8			/* Lowercase character */
+#define DI  9			/* Digit */
 
-#define isBlank(c)	(char_type[(unsigned)(c) & 0xff] == SP)
-#define isDigit(c)	(char_type[(unsigned)(c) & 0xff] == DI)
-#define isLower(c)	(char_type[(unsigned)(c) & 0xff] == LC)
-#define isUpper(c)	(char_type[(unsigned)(c) & 0xff] == UC)
-#define isSymbol(c)	(char_type[(unsigned)(c) & 0xff] == SY)
-#define isPunct(c)	(char_type[(unsigned)(c) & 0xff] == PU)
-#define isSolo(c)	(char_type[(unsigned)(c) & 0xff] == SO)
-#define isAlpha(c)	(char_type[(unsigned)(c) & 0xff] >= UC)
+#define isControl(c)	(_PL_char_types[(unsigned)(c) & 0xff] == CT)
+#define isBlank(c)	(_PL_char_types[(unsigned)(c) & 0xff] <= SP)
+#define isDigit(c)	(_PL_char_types[(unsigned)(c) & 0xff] == DI)
+#define isLower(c)	(_PL_char_types[(unsigned)(c) & 0xff] == LC)
+#define isUpper(c)	(_PL_char_types[(unsigned)(c) & 0xff] == UC)
+#define isSymbol(c)	(_PL_char_types[(unsigned)(c) & 0xff] == SY)
+#define isPunct(c)	(_PL_char_types[(unsigned)(c) & 0xff] == PU)
+#define isSolo(c)	(_PL_char_types[(unsigned)(c) & 0xff] == SO)
+#define isAlpha(c)	(_PL_char_types[(unsigned)(c) & 0xff] >= UC)
 #define isLetter(c)	(isLower(c) || isUpper(c))
 
 #define toLower(c)	((c) + 'a' - 'A')

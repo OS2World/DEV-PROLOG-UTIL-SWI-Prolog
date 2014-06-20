@@ -1,14 +1,26 @@
-/*  pl-gc.c,v 1.3 1993/02/23 13:16:32 jan Exp
+/*  $Id: pl-gc.c,v 1.71 2001/05/15 16:08:24 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Garbage Collection
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
-/*#define O_DEBUG 1*/
+#ifdef SECURE_GC
+#define O_DEBUG 1
+#define O_SECURE 1
+#endif
 #include "pl-incl.h"
+
+#ifndef HAVE_MEMMOVE			/* Note order!!!! */
+#define memmove(dest, src, n) bcopy(src, dest, n)
+#endif
+#undef ulong
+#define ulong unsigned long
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 This module is based on
@@ -43,7 +55,7 @@ The virtual machine interpreter now should ensure the stack  frames  are
 in  a predicatable state.  For the moment, this implies that all frames,
 except for the current one (which only has its arguments filled)  should
 be  initialised fully.  I'm not yet sure whether we can't do better, but
-this is simple and save and allows us to  debug  the  garbage  collector
+this is simple and safe and allows us to  debug  the  garbage  collector
 first before starting on the optimisations.
 
 
@@ -73,7 +85,7 @@ actions  are  counted  during garbage collection.  At regular points the
 consistency between these counts  is  verified.   This  causes  a  small
 performance degradation, but for the moment is worth this I think.
 
-If the O_DEBUG cpp flag is set  some  additional  expensive  consistency
+If the O_SECURE cpp flag is set  some  additional  expensive  consistency
 checks  that need considerable amounts of memory and cpu time are added.
 Garbage collection gets about 3-4 times as slow.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
@@ -85,8 +97,10 @@ Marking, testing marks and extracting values from GC masked words.
 #define GC_MASK		(MARK_MASK|FIRST_MASK)
 #define VALUE_MASK	(~GC_MASK)
 
-#if O_DEBUG
-#define recordMark(p)	{ if ( (p) < gTop ) *mark_top++ = (p); }
+#if O_SECURE
+char tmp[256];				/* for calling print_val(), etc. */
+#define check_relocation(p) do_check_relocation(p, __FILE__, __LINE__)
+#define recordMark(p)   { if ( (p) < gTop ) *mark_top++ = (p); }
 #else
 #define recordMark(p)
 #define needsRelocation(p) { needs_relocation++; }
@@ -94,11 +108,12 @@ Marking, testing marks and extracting values from GC masked words.
 #endif
 
 #define ldomark(p)	{ *(p) |= MARK_MASK; }
-#define domark(p)	{ if ( marked(p) ) sysError("marked twice: 0x%lx (*= 0x%lx), gTop = 0x%lx", p, *(p), gTop); \
+#define domark(p)	{ if ( marked(p) ) \
+			    sysError("marked twice: 0x%p (*= 0x%lx), gTop = 0x%p", p, *(p), gTop); \
 			  *(p) |= MARK_MASK; \
 			  total_marked++; \
 			  recordMark(p); \
-			  DEBUG(4, printf("marked(0x%lx)\n", p)); \
+			  DEBUG(4, Sdprintf("marked(0x%p)\n", p)); \
 			}
 #define unmark(p)	(*(p) &= ~MARK_MASK)
 #define marked(p)	(*(p) & MARK_MASK)
@@ -106,126 +121,257 @@ Marking, testing marks and extracting values from GC masked words.
 #define mark_first(p)	(*(p) |= FIRST_MASK)
 #define unmark_first(p)	(*(p) &= ~FIRST_MASK)
 #define is_first(p)	(*(p) & FIRST_MASK)
+#define is_ref(w)	isRef(w)
 
 #define get_value(p)	(*(p) & VALUE_MASK)
 #define set_value(p, w)	{ *(p) &= GC_MASK; *(p) |= w; }
+#define val_ptr2(w, s)	((Word)((ulong)valPtr2((w), (s)) & ~0x3L))
+#define val_ptr(w)	val_ptr2((w), storage(w))
 
-#define onGlobal(p)	((Word)(p) >= gBase && (Word)(p) < gTop)
-#define isGlobalRef(w)	(  ((isIndirect(w) || isPointer(w)) \
-				&& onGlobal(unMask(w))) \
-			|| (isRef(w) && onGlobal(unRef(w))))
+#define inShiftedArea(area, shift, ptr) \
+	((char *)ptr >= (char *)LD->stacks.area.base + shift && \
+	 (char *)ptr <  (char *)LD->stacks.area.max + shift )
+#define topPointerOnStack(name, addr) \
+	((char *)(addr) >= (char *)LD->stacks.name.base && \
+	 (char *)(addr) <  (char *)LD->stacks.name.max)
 
-#define L_MARK 	  0	/* Foreign reference marks */
-#define L_WORD	  1
-#define L_POINTER 2
+#define onGlobal(p)	onStackArea(global, p) /* onStack()? */
+#define onLocal(p)	onStackArea(local, p)
+#define onTrail(p)	topPointerOnStack(trail, p)
 
-forwards long		offset_cell P((Word));
-forwards Word		previous_gcell P((Word));
-forwards void		mark_variable P((Word));
-forwards void		mark_foreign P((void));
-forwards void		clear_uninitialised P((LocalFrame, Code));
-forwards LocalFrame	mark_environments P((LocalFrame));
-forwards void		mark_choicepoints P((LocalFrame));
-forwards void		mark_stacks P((LocalFrame));
-forwards void		mark_phase P((LocalFrame));
-forwards void		update_relocation_chain P((Word, Word));
-forwards void		into_relocation_chain P((Word));
-forwards void		compact_trail P((void));
-forwards void		sweep_mark P((mark *));
-forwards void		sweep_foreign P((void));
-forwards void		sweep_trail P((void));
-forwards LocalFrame	sweep_environments P((LocalFrame));
-forwards void		sweep_choicepoints P((LocalFrame));
-forwards void		sweep_stacks P((LocalFrame));
-forwards void		sweep_local P((LocalFrame));
-forwards bool		is_downward_ref P((Word));
-forwards bool		is_upward_ref P((Word));
-forwards void		compact_global P((void));
-forwards void		collect_phase P((LocalFrame));
-
-#if O_DEBUG
-forwards int		cmp_address P((Word *, Word *));
-forwards void		check_relocation P((Word));
-forwards void		needsRelocation P((Word));
-forwards bool		scan_global P((void));
+#ifndef offset
+#define offset(s, f) ((int)(&((struct s *)NULL)->f))
 #endif
+
+#define ttag(x)		(((word)(x))&TAG_TRAILMASK)
+
+		 /*******************************
+		 *     FUNCTION PROTOTYPES	*
+		 *******************************/
+
+forwards void		mark_variable(Word);
+forwards void		sweep_foreign(void);
+forwards QueryFrame	mark_environments(LocalFrame, Code PC);
+forwards void		update_relocation_chain(Word, Word);
+forwards void		into_relocation_chain(Word, int stg);
+forwards void		alien_into_relocation_chain(void *addr,
+						    int orgst, int stg);
+forwards void		compact_trail(void);
+forwards void		sweep_mark(mark *);
+forwards void		sweep_trail(void);
+forwards bool		is_downward_ref(Word);
+forwards bool		is_upward_ref(Word);
+forwards void		compact_global(void);
+
+#if O_SECURE
+forwards int		cmp_address(const void *, const void *);
+forwards void		do_check_relocation(Word, char *file, int line);
+forwards void		needsRelocation(void *);
+forwards bool		scan_global(int marked);
+forwards void		check_mark(mark *m);
+#endif
+
 		/********************************
 		*           GLOBALS             *
 		*********************************/
 
-static long total_marked;	/* # marked global cells */
-static long trailcells_deleted;	/* # garbage trailcells */
-static long relocation_chains;	/* # relocation chains (debugging) */
-static long relocation_cells;	/* # relocation cells */
-static long relocated_cells;	/* # relocated cells */
-static long needs_relocation;	/* # cells that need relocation */
-static long local_marked;	/* # cells marked local -> global ptrs */
-static long relocation_refs;	/* # refs that need relocation */
-static long relocation_indirect;/* # indirects */
+#define	total_marked	   (LD->gc._total_marked)
+#define	trailcells_deleted (LD->gc._trailcells_deleted)
+#define	relocation_chains  (LD->gc._relocation_chains)
+#define	relocation_cells   (LD->gc._relocation_cells)
+#define	relocated_cells	   (LD->gc._relocated_cells)
+#define	needs_relocation   (LD->gc._needs_relocation)
+#define	local_marked	   (LD->gc._local_marked)
+#define	marks_swept	   (LD->gc._marks_swept)
+#define	marks_unswept	   (LD->gc._marks_unswept)
+#define	alien_relocations  (LD->gc._alien_relocations)
+#define local_frames	   (LD->gc._local_frames)
+#define choice_count	   (LD->gc._choice_count)
+#if O_SECURE
+static long trailtops_marked;		/* # marked trailtops */
+static Word *mark_base;			/* Array of marked cells addresses */
+static Word *mark_top;			/* Top of this array */
+static Table check_table = NULL;	/* relocation address table */
+#endif
 
-#if O_DEBUG
+#undef LD
+#define LD LOCAL_LD
+
+#if O_SECURE
 		/********************************
 		*           DEBUGGING           *
 		*********************************/
 
-static Word *mark_base;			/* Array of addresses of marked cells */
-static Word *mark_top;			/* Top of this array */
-static Table check_table = NULL;	/* relocation address table */
-
 static void
-needsRelocation(addr)
-Word addr;
-{ needs_relocation++;
+needsRelocation(void *addr)
+{ GET_LD
+
+  needs_relocation++;
 
   addHTable(check_table, addr, (Void) TRUE);
 }
 
+
+static char *
+print_adr(Word adr, char *buf)
+{ GET_LD
+  char *name;
+  Word base;
+
+  if ( onGlobal(adr) )
+  { name = "global";
+    base = gBase;
+  } else if ( onLocal(adr) )
+  { name = "local";
+    base = (Word) lBase;
+  } else if ( onTrail(adr) )
+  { name = "trail";
+    base = (Word) tBase;
+  } else
+  { Ssprintf(buf, "%p", adr);
+    return buf;
+  }
+
+  Ssprintf(buf, "%p=%s(%d)", adr, name, adr-base);
+  return buf;
+}
+
+
+static char *
+print_val(word val, char *buf)
+{ GET_LD
+  char *tag_name[] = { "var", "float", "int", "atom",
+		       "string", "list", "term", "ref" };
+  char *stg_name[] = { "static/inline/trail", "global", "local", "reserved" };
+
+  Ssprintf(buf, "%s at %s(%ld)",
+	   tag_name[tag(val)],
+	   stg_name[storage(val) >> 3],
+	   val >> LMASK_BITS);
+  if ( val & MARK_MASK )
+    strcat(buf, "M");
+  if ( val & FIRST_MASK )
+    strcat(buf, "F");
+
+  return buf;
+}
+
 static void
-check_relocation(addr)
-Word addr;
-{ Symbol s;
-  if ( (s=lookupHTable(check_table, addr)) == NULL )
-  { sysError("Address 0x%lx was not supposed to be relocated", addr);
+do_check_relocation(Word addr, char *file, int line)
+{ GET_LD
+  Symbol s;
+
+  if ( !(s=lookupHTable(check_table, addr)) )
+  { char buf1[256];
+    char buf2[256];
+    sysError("%s:%d: Address %s (%s) was not supposed to be relocated",
+	     file, line, print_adr(addr, buf1), print_val(*addr, buf2));
     return;
   }
 
-  if ( s->value == FALSE )
-  { sysError("Relocated twice: 0x%lx", addr);
+  if ( !s->value )
+  { sysError("%s:%d: Relocated twice: 0x%lx", file, line, addr);
     return;
   }
 
   s->value = FALSE;
 }
-#endif /* O_DEBUG */
+
+#endif /* O_SECURE */
 
 		/********************************
 		*          UTILITIES            *
 		*********************************/
 
-static long
-offset_cell(p)
-Word p;
-{ word w = get_value(p);
-
-  if ( (w & DATA_TAG_MASK) == REAL_MASK )
-  { DEBUG(3, printf("REAL at 0x%lx (w = 0x%lx)\n", p, w));
-    return 1;
-  }
-  if ( (w & DATA_TAG_MASK) == STRING_MASK )
-  { long l = ((w) << DMASK_BITS) >> (DMASK_BITS+LMASK_BITS);
-    DEBUG(3, printf("STRING ``%s'' at 0x%lx (w = 0x%lx)\n", p, p+1, w));
-    return allocSizeString(l) / sizeof(word) - 1;
-  }
-  
-  return 0;
+static inline int
+isGlobalRef(word w)
+{ return storage(w) == STG_GLOBAL;
 }
 
-static Word
-previous_gcell(p)
-Word p;
+
+static inline int
+offset_cell(Word p)
+{ word m = *p;				/* was get_value(p) */
+  int offset;
+
+  if ( storage(m) == STG_LOCAL )
+    offset = wsizeofInd(m) + 1;
+  else
+    offset = 0;
+
+  return offset;
+}
+
+
+static inline Word
+previous_gcell(Word p)
 { p--;
   return p - offset_cell(p);
 }
+
+
+static inline word
+makePtr(Word ptr, int tag)
+{ GET_LD
+  int stg;
+
+  if ( onStackArea(global, ptr) )
+    stg = STG_GLOBAL;
+  else if ( onStackArea(local, ptr) )
+    stg = STG_LOCAL;
+  else
+  { assert(onStackArea(trail, ptr));
+    stg = STG_TRAIL;
+  }
+
+  return consPtr(ptr, tag|stg);
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Clear the FR_MARKED flags left after traversing all reachable frames.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static QueryFrame
+unmark_environments(PL_local_data_t *ld, LocalFrame fr)
+{ if ( fr == NULL )
+    return NULL;
+
+  for(;;)
+  { if ( false(fr, FR_MARKED) )
+      return NULL;
+    clear(fr, FR_MARKED);
+    ld->gc._local_frames--;
+    
+    if ( fr->parent )
+      fr = fr->parent;
+    else				/* Prolog --> C --> Prolog calls */
+      return (QueryFrame)addPointer(fr, -offset(queryFrame, frame));
+  }
+}
+
+
+static void
+unmark_choicepoints(PL_local_data_t *ld, Choice ch)
+{ for( ; ch; ch = ch->parent )
+  { ld->gc._choice_count--;
+    unmark_environments(ld, ch->frame);
+  }
+}
+
+
+static void
+unmark_stacks(PL_local_data_t *ld, LocalFrame fr, Choice ch)
+{ QueryFrame qf;
+
+  for( ; fr; fr = qf->saved_environment, ch = qf->saved_bfr )
+  { qf = unmark_environments(ld, fr);
+    assert(qf->magic == QID_MAGIC);
+    unmark_choicepoints(ld, ch);
+  }
+}
+
+
 
 		/********************************
 		*            MARKING            *
@@ -248,38 +394,30 @@ supposed to hold:
       number is only used for consistency checking with the relocation
       statistic obtained during the compacting phase.
 
-The marking algorithm forms a two-state  machine.   While  going  deeper
-into  the reference tree, the pointers are reversed and the first bit is
-set to indicate the choiche points created by complex terms with arity >
-1.  Also the actuall mark bit is set  on  the  cells.   If  a  leafe  is
-reached  the process reverses, restoring the old pointers.  If a `first'
-mark is reached we are either finished, or have reached a choice  point,
-in  which case the alternative is the cell above (structures are handled
+The marking algorithm forms a two-state machine. While going deeper into
+the reference tree, the pointers are reversed  and the FIRST_MASK is set
+to indicate the choice points created by   complex terms with arity > 1.
+Also the actual mark bit is set on the   cells. If a leaf is reached the
+process reverses, restoring the  old  pointers.   If  a  `first' mark is
+reached we are either finished, or have reached a choice point, in which
+case  the  alternative  is  the  cell   above  (structures  are  handled
 last-argument-first).
-
-Mark the tree of global stack cells, referenced by the local stack  word
-`start'.  Things are a bit more difficult than described in the liteture
-above as SWI-Prolog does not use  a  structure  to  describe  a  general
-Prolog object, but just a 32 bits long.  This has performance advantages
-as we can exploit things like using negative numbers for references.  It
-has  some  disadvantages  here as we have to distinguis some more cases.
-Strings and reals on the stacks complicate matters even more.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #define FORWARD		goto forward
 #define BACKWARD	goto backward
 
 static void
-mark_variable(start)
-Word start;
-{ register Word current;		/* current cell examined */
-  register word val;			/* old value of current cell */
-  register Word next;			/* cell to be examined */
+mark_variable(Word start)
+{ GET_LD
+  Word current;				/* current cell examined */
+  word val;				/* old value of current cell */
+  Word next;				/* cell to be examined */
 
-  DEBUG(2, printf("marking 0x%lx\n", start));
+  DEBUG(3, Sdprintf("marking 0x%p\n", start));
 
   if ( marked(start) )
-    sysError("Attempth to mark twice");
+    sysError("Attempt to mark twice");
 
   local_marked++;
   current = start;
@@ -293,75 +431,74 @@ forward:				/* Go into the tree */
     BACKWARD;
   domark(current);
 
-  if ( isRef(val) )
-  { next = unRef(val);			/* address pointing to */
-    if ( next < gBase )
-      sysError("REF pointer to 0x%lx\n", next);
-    needsRelocation(current);
-    relocation_refs++;
-    if ( is_first(next) )		/* ref to choice point. we will */
-      BACKWARD;				/* get there some day anyway */
-    val  = get_value(next);		/* invariant */
-    set_value(next, makeRef(current));	/* create backwards pointer */
-    DEBUG(5, printf("Marking REF from 0x%lx to 0x%lx\n", current, next));
-    current = next;			/* invariant */
-    FORWARD;
-  }
-  /* This is isTerm(); but that is not selective enough (TROUBLE) */
-  if ( isPointer(val) &&
-       isPointer(get_value((Word)val)) &&
-       ((FunctorDef)get_value((Word)val))->type == FUNCTOR_TYPE )
-  { int args;
+  switch(tag(val))
+  { case TAG_REFERENCE:
+    { next = unRef(val);		/* address pointing to */
+      if ( next < gBase )
+	sysError("REF pointer to 0x%p\n", next);
+      needsRelocation(current);
+      if ( is_first(next) )		/* ref to choice point. we will */
+        BACKWARD;			/* get there some day anyway */
+      val  = get_value(next);		/* invariant */
+      set_value(next, makeRef(current));/* create backwards pointer */
+      DEBUG(5, Sdprintf("Marking REF from 0x%p to 0x%p\n", current, next));
+      current = next;			/* invariant */
+      FORWARD;
+    }
+    case TAG_COMPOUND:
+    { int args;
 
-    needsRelocation(current);
-    next = (Word) val;			/* address of term on global stack */
-    if ( next < gBase || next >= gTop )
-      sysError("TERM pointer to 0x%lx\n", next);
-    if ( marked(next) )
-      BACKWARD;				/* term has already been marked */
-    args = functorTerm(val)->arity - 1;	/* members to flag first */
-    DEBUG(5, printf("Marking TERM %s/%d at 0x%lx\n", stringAtom(functorTerm(val)->name), args+1, next));
-    domark(next);
-    for( next += 2; args > 0; args--, next++ )
-      mark_first(next);
-    next--;				/* last cell of term */
-    val = get_value(next);		/* invariant */
-    set_value(next, (word)current);	/* backwards pointer (NO ref!) */
-    current = next;
-    FORWARD;
-  }
-  if ( isIndirect(val) )		/* string or real pointer */
-  { next = (Word) unMask(val);
+      SECURE(assert(storage(val) == STG_GLOBAL));
+      next = valPtr2(val, STG_GLOBAL);
+      needsRelocation(current);
+      if ( marked(next) )
+	BACKWARD;			/* term has already been marked */
+      args = arityFunctor(((Functor)next)->definition) - 1;
+      DEBUG(5, Sdprintf("Marking TERM %s/%d at 0x%p\n",
+			stringAtom(nameFunctor(((Functor)next)->definition)),
+			args+1, next));
+      domark(next);
+      for( next += 2; args > 0; args--, next++ )
+	mark_first(next);
+      next--;				/* last cell of term */
+      val = get_value(next);		/* invariant */
+					/* backwards pointer (NO ref!) */
+      set_value(next, makePtr(current, TAG_COMPOUND));
+      current = next;
+      FORWARD;
+    }
+    case TAG_INTEGER:
+      if ( storage(val) == STG_INLINE )
+	BACKWARD;
+    case TAG_STRING:
+    case TAG_FLOAT:			/* indirects */
+    { next = valPtr2(val, STG_GLOBAL);
 
-    if ( next < gBase )
-      sysError("INDIRECT pointer from 0x%lx to 0x%lx\n", current, next);
-    needsRelocation(current);
-    relocation_indirect++;
-    if ( marked(next) )			/* can be referenced from multiple */
-      BACKWARD;				/* places */
-    domark(next);
-    DEBUG(3, printf("Marked indirect data type, size = %ld\n",
-		    offset_cell(next) + 1));
-    total_marked += offset_cell(next);
+      SECURE(assert(storage(val) == STG_GLOBAL));
+      needsRelocation(current);
+      if ( marked(next) )		/* can be referenced from multiple */
+        BACKWARD;			/* places */
+      domark(next);
+      DEBUG(3, Sdprintf("Marked indirect data type, size = %ld\n",
+			offset_cell(next) + 1));
+      total_marked += offset_cell(next);
+    }
   }
   BACKWARD;
 
 backward:  				/* reversing backwards */
-  if ( !is_first(current) )
-  { if ( isRef(get_value(current)) )	/* internal cell */
-    { next = unRef(get_value(current));
-      set_value(current, val);		/* restore its value */
-      val  = makeRef(current);		/* invariant */
-      current = next;			/* invariant */
-      BACKWARD;
-    } else				/* first cell of term */
-    { next = (Word) get_value(current);
-      set_value(current, val);		/* elements of term ok now */
-      val = (word)(current - 1);	/* invariant */
-      current = next;
-      BACKWARD;
-    }
+  while( !is_first(current) )
+  { word w = get_value(current);
+
+    next = valPtr(w);
+    set_value(current, val);
+    if ( isRef(w) )
+      val = makeRef(current);
+    else
+      val = makePtr(current-1, TAG_COMPOUND);
+    current= next;
   }
+
   unmark_first(current);
   if ( current == start )
     return;
@@ -377,102 +514,136 @@ backward:  				/* reversing backwards */
   }
 }
 
+
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 References from foreign code.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 static void
-mark_foreign()
-{ Lock l;
+mark_term_refs()
+{ GET_LD
+  FliFrame fr = fli_context;
 
-  for( l = pBase; l < pTop; l++ )
-  { switch( l->type )
-    { case L_WORD:
-	{ Word sp = (Word) (l->value << 2);
+  for( ; fr; fr = fr->parent )
+  { Word sp = refFliP(fr, 0);
+    int n = fr->size;
 
-	  if ( isGlobalRef(*sp) );
-	  { DEBUG(5, printf("Marking foreign value at 0x%lx\n"));
-	    mark_variable(sp);
-	  }
+    for( ; n-- > 0; sp++ )
+    { if ( !marked(sp) )		/* can this be marked?? */
+      { if ( isGlobalRef(*sp) )
+	  mark_variable(sp);
+	else
+	  ldomark(sp);      
+      }
+    }
+  }
+}
 
+
+static void
+mark_foreign_trail_refs()
+{ GET_LD
+  FliFrame fr = fli_context;
+
+  for( ; fr; fr = fr->parent )
+  { needsRelocation(&fr->mark.trailtop);
+    alien_into_relocation_chain(&fr->mark.trailtop, STG_TRAIL, STG_LOCAL);
+  }
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+clearUninitialisedVarsFrame(LocalFrame fr, Code PC);
+
+Assuming the clause associated will resume   execution  at PC, determine
+the variables that are not yet initialised and set them to be variables.
+This  avoids  the  garbage  collector    considering  the  uninitialised
+variables.
+
+[Q] wouldn't it be better to track  the variables that *are* initialised
+and consider the others to be not?  Might   take more time, but might be
+more reliable and simpler.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+void
+clearUninitialisedVarsFrame(LocalFrame fr, Code PC)
+{ if ( PC != NULL )
+  { code c;
+
+    for( ; ; PC += (codeTable[c].arguments + 1))
+    { c = decode(*PC);
+
+    again:
+      switch( c )
+      {
+#if O_DEBUGGER
+	case D_BREAK:
+	  c = decode(replacedBreak(PC));
+	  goto again;
+#endif
+	case H_INDIRECT:		/* only skip the size of the */
+	case B_INDIRECT:		/* string + header */
+	{ word m = PC[1];
+	  PC += wsizeofInd(m)+1;
 	  break;
 	}
-      case L_POINTER:
-	{ Word *sp = (Word *) (l->value << 2);
-
-	  if ( !marked(*sp) && isGlobalRef(**sp) )
-	  { DEBUG(5, printf("Marking foreign pointer at 0x%lx\n"));
-	    mark_variable(*sp);
-	  }
-
+	case I_EXIT:
+	case I_EXITFACT:
+	  return;
+	case C_JMP:
+	  PC += (int)PC[1]+2;
+	  c = decode(*PC);
+	  goto again;
+	case B_FIRSTVAR:
+	case B_ARGFIRSTVAR:
+	case C_VAR:
+#if O_SECURE	  
+	  if ( varFrameP(fr, PC[1]) <
+	       argFrameP(fr, fr->predicate->functor->arity) )
+	    sysError("Reset instruction on argument");
+	  assert(varFrame(fr, PC[1]) != QID_MAGIC);
+#endif
+	  setVar(varFrame(fr, PC[1]));
 	  break;
-	}
-      case L_MARK:
-	break;
+      }
     }
   }
 }
 
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Marking the environments.
+Mark environments and all data that can   be  reached from them. Returns
+the QueryFrame that started this environment,  which provides use access
+to the parent `foreign' environment.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-static void
-clear_uninitialised(fr, PC)
-LocalFrame fr;
-Code PC;
-{ if ( PC != NULL )
-  { Code branch_end = NULL;
-
-    for( ; ; PC += (codeTable[decode(*PC)].arguments + 1))
-    { switch(decode(*PC))
-      { case I_EXIT:
-	  return;
-	case C_JMP:
-	  if ( PC >= branch_end )
-	    branch_end = PC + PC[1] + 2;
-	  break;
-	case B_FIRSTVAR:
-	case B_ARGFIRSTVAR:
-	case C_VAR:
-	  if ( varFrameP(fr, PC[1]) < argFrameP(fr, fr->procedure->functor->arity) )
-	    sysError("Reset instruction on argument");
-	  if ( PC >= branch_end )
-	    setVar(varFrame(fr, PC[1]));
-	  break;
-      }
-      if ( decode(*PC) > I_HIGHEST )
-	sysError("GC: Illegal WAM instruction: %d", decode(*PC));
-    }
-  }
-}
-
-
-static LocalFrame
-mark_environments(fr)
-LocalFrame fr;
-{ Code PC = NULL;
-
-  if ( fr == (LocalFrame) NULL )
-    return (LocalFrame) NULL;
+static QueryFrame
+mark_environments(LocalFrame fr, Code PC)
+{ if ( !fr )
+    return NULL;
 
   for( ; ; )
   { int slots;
     Word sp;
-    
+#if O_SECURE
+    int oslots;
+#endif
+
     if ( true(fr, FR_MARKED) )
-      return (LocalFrame) NULL;		/* from choicepoints only */
+      return NULL;			/* from choicepoints only */
     set(fr, FR_MARKED);
     
-    DEBUG(2, printf("Marking [%ld] %s\n",
-		levelFrame(fr), procedureName(fr->procedure)));
+    DEBUG(3, Sdprintf("Marking [%ld] %s\n",
+		      levelFrame(fr), predicateName(fr->predicate)));
 
-    clear_uninitialised(fr, PC);
+    clearUninitialisedVarsFrame(fr, PC);
 
-    slots = (PC == NULL ? fr->procedure->functor->arity : slotsFrame(fr));
+    slots   = (PC == NULL ? fr->predicate->functor->arity : slotsFrame(fr));
+#if O_SECURE
+    oslots = slots;
+#endif
     sp = argFrameP(fr, 0);
-    for( ; slots > 0; slots--, sp++ )
+    for( ; slots-- > 0; sp++ )
     { if ( !marked(sp) )
       { if ( isGlobalRef(*sp) )
 	  mark_variable(sp);
@@ -485,77 +656,173 @@ LocalFrame fr;
     if ( fr->parent != NULL )
       fr = fr->parent;
     else
-      return parentFrame(fr);	/* Prolog --> C --> Prolog calls */
+      return (QueryFrame)addPointer(fr, -offset(queryFrame, frame));
   }
 }
 
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Mark the choicepoints. This function walks   along the environments that
+can be reached from  the  choice-points.   In  addition,  it deletes all
+trail-references  that  will   be   overruled    by   the   choice-point
+stack-reference anyway.
+
+When using setarg/3 (O_DESTRUCTIVE_ASSIGNMENT),   destrctive assignments
+are stored on the trail-stack as  two   entries.  The first entry is the
+normal trail-pointer, while the  second   is  flagged  with TAG_TRAILVAL
+(0x1). When undoing, the tail is scanned backwards and if a tagged value
+is encountered, this value is restored  at   the  location  of the first
+trail-cell.
+
+If the has become  garbage,  we  can   destroy  both  cells.  Note  that
+mark_trail() already has marked the replaced value,  so that will not be
+garbage collected during this pass. 
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static GCTrailEntry
+mark_choicepoints(Choice ch, GCTrailEntry te)
+{ GET_LD
+
+  for( ; ch; ch = ch->parent )
+  { LocalFrame fr = ch->frame;
+    GCTrailEntry tm = (GCTrailEntry)ch->mark.trailtop;
+    Word top;
+
+    if ( ch->type == CHP_CLAUSE )
+      top = argFrameP(fr, fr->predicate->functor->arity);
+    else
+    { assert(ch->type == CHP_TOP || (void *)ch > (void *)fr);
+      top = (Word)ch;
+    }
+
+    for( ; te >= tm; te-- )		/* early reset of vars */
+    { 
+#if O_DESTRUCTIVE_ASSIGNMENT
+      if ( ttag(te->address) != TAG_TRAILVAL )
+#endif
+      { Word tard = val_ptr(te->address);
+
+	if ( tard >= top )		/* above local stack */
+	{ SECURE(assert(ttag(te[1].address) != TAG_TRAILVAL));
+	  te->address = 0;
+	  trailcells_deleted++;
+	} else if ( !marked(tard) )	/* garbage */
+	{ setVar(*tard);
+	  SECURE(assert(*tard != QID_MAGIC));
+#if O_DESTRUCTIVE_ASSIGNMENT
+	  if ( ttag(te[1].address) == TAG_TRAILVAL)
+	  { te[1].address = 0;
+	    trailcells_deleted++;
+	  }
+#endif
+	  DEBUG(3, Sdprintf("Early reset of 0x%p\n", te->address));
+	  te->address = 0;
+	  trailcells_deleted++;
+	}
+      }
+    }
+
+    needsRelocation(&ch->mark.trailtop);
+    alien_into_relocation_chain(&ch->mark.trailtop, STG_TRAIL, STG_LOCAL);
+    SECURE(trailtops_marked--);
+
+    mark_environments(fr,
+		      ch->type == CHP_JUMP ? ch->value.PC : NULL);
+  }
+
+  return te;
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+mark_stacks() marks all  data  that  is   reachable  from  any  frame or
+choicepoint. In addition, it  will  do   `early  reset'  on variables of
+choicepoints that will be  reset  anyway   if  backtracking  reaches the
+choicepoint. Also, it  will  insert  all   trailtops  of  marks  in  the
+relocation chains. A small problem is  the   top-goal  of  a query, This
+frame may not be a  choicepoint,  but   its  mark  is  needed anyhow for
+PL_close_query(), so it has to be relocated.  `te' in the function below
+has to be updated as none of these variables should be reset
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
 static void
-mark_choicepoints(bfr)
-LocalFrame bfr;
-{ TrailEntry te = tTop - 1;
+mark_stacks(LocalFrame fr, Choice ch)
+{ GET_LD
+  QueryFrame query;
+  GCTrailEntry te = (GCTrailEntry)tTop - 1;
 
   trailcells_deleted = 0;
 
-  for( ; bfr != (LocalFrame)NULL; bfr = bfr->backtrackFrame )
-  { Word top = argFrameP(bfr, bfr->procedure->functor->arity);
+  for( ; fr; fr = query->saved_environment, ch = query->saved_bfr )
+  { query = mark_environments(fr, NULL);
+    te    = mark_choicepoints(ch, te);
 
-    for( ; te >= bfr->mark.trailtop; te-- )	/* early reset of vars */
-    { if ( te->address >= top )
-      { te->address = (Word) NULL;
-        trailcells_deleted++;
-      } else if ( !marked(te->address) )
-      { setVar(*te->address);
-        DEBUG(3, printf("Early reset of 0x%lx\n", te->address));
-        te->address = (Word) NULL;
-	trailcells_deleted++;
-      }
-    }
-    needsRelocation((Word)&bfr->mark.trailtop);
-    into_relocation_chain((Word)&bfr->mark.trailtop);
-
-    mark_environments(bfr);
+    assert(query->magic == QID_MAGIC);
   }
   
-  DEBUG(3, printf("Trail stack garbage: %ld cells\n", trailcells_deleted));
+  DEBUG(2, Sdprintf("Trail stack garbage: %ld cells\n", trailcells_deleted));
 }
 
+
+#ifdef O_DESTRUCTIVE_ASSIGNMENT
 static void
-mark_stacks(fr)
-LocalFrame fr;
-{ LocalFrame pfr;
+mark_trail()
+{ GET_LD
+  GCTrailEntry te = (GCTrailEntry)tTop - 1;
 
-  if ( (pfr = mark_environments(fr)) != NULL )
-    mark_stacks(pfr);
+  for( ; te >= (GCTrailEntry)tBase; te-- )
+  { Word gp;
 
-  mark_choicepoints(fr);
+    if ( ttag(te->address) == TAG_TRAILVAL )
+    { gp = val_ptr(te->address);
+
+      DEBUG(2, Sdprintf("mark_trail(): trailed value from %p at %p (*=%p)\n",
+			&te->address, gp, *gp));
+
+      assert(onGlobal(gp));
+      if ( !marked(gp) )
+      { mark_variable(gp);
+	total_marked++;			/* fix counters */
+	local_marked--;
+      }
+    }
+  }
 }
+#endif /*O_DESTRUCTIVE_ASSIGNMENT*/
 
-#if O_DEBUG
+
+#if O_SECURE
 static int
-cmp_address(p1, p2)
-Word *p1, *p2;
-{ return *p1 > *p2 ? 1 : *p1 == *p2 ? 0 : -1;
+cmp_address(const void *vp1, const void *vp2)
+{ GET_LD
+  Word p1 = *((Word *)vp1);
+  Word p2 = *((Word *)vp2);
+
+  return p1 > p2 ? 1 : p1 == p2 ? 0 : -1;
 }
 #endif
 
+
 static void
-mark_phase(fr)
-LocalFrame fr;
-{ total_marked = 0;
-#if O_DEBUG
-  mark_top = mark_base = (Word *) addPointer(lTop, 8192);	/* hack */
+mark_phase(LocalFrame fr, Choice ch)
+{ GET_LD
+  total_marked = 0;
+
+  mark_term_refs();
+#ifdef O_DESTRUCTIVE_ASSIGNMENT
+  mark_trail();
 #endif
-
-  mark_foreign();
-  mark_stacks(fr);
-
-#if O_DEBUG
+  mark_stacks(fr, ch);
+  mark_foreign_trail_refs();
+#if O_SECURE
+  if ( !scan_global(TRUE) )
+    sysError("Global stack corrupted after GC mark-phase");
   qsort(mark_base, mark_top - mark_base, sizeof(Word), cmp_address);
 #endif
 
   DEBUG(2, { long size = gTop - gBase;
-	     printf("%ld referenced cell; %ld garbage (gTop = 0x%lx)\n",
-		    total_marked, size - total_marked, gTop);
+	     Sdprintf("%ld referenced cell; %ld garbage (gTop = 0x%p)\n",
+		      total_marked, size - total_marked, gTop);
 	   });
 }
 
@@ -592,63 +859,42 @@ chain.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 static void
-update_relocation_chain(current, dest)
-Word current, dest;
-{ if ( is_first(current) )
-  { Word head = current;
-    word val = get_value(current);
+update_relocation_chain(Word current, Word dest)
+{ GET_LD
+  Word head = current;
+  word val = get_value(current);
 
-    DEBUG(2, printf("unwinding relocation chain at 0x%lx to 0x%lx\n", current, dest));
+  DEBUG(3, Sdprintf("unwinding relocation chain at 0x%p to 0x%p\n",
+		    current, dest));
 
-    do
-    { unmark_first(current);
-      if ( isRef(val) )
-      { current = unRef(val);
-        val = get_value(current);
-	DEBUG(2, printf("Ref from 0x%lx\n", current));
-        set_value(current, makeRef(dest));
-      } else if ( isIndirect(val) )
-      { current = (Word)unMask(val);
-        val = get_value(current);
-        DEBUG(2, printf("Indirect link from 0x%lx\n", current));
-        set_value(current, (word)dest | INDIRECT_MASK);
-      } else
-      { current = (Word) val;
-        val = get_value(current);
-        DEBUG(2, printf("Pointer from 0x%lx\n", current));
-        set_value(current, (word)dest);
-      }
-      relocated_cells++;
-    } while( is_first(current) );
+  do
+  { int tag;
 
-    set_value(head, val);
-    relocation_chains--;
-  }
+    unmark_first(current);
+    current = valPtr(val);
+    tag = tag(val);
+    val = get_value(current);
+    set_value(current, makePtr(dest, tag));
+    relocated_cells++;
+  } while( is_first(current) );
+
+  set_value(head, val);
+  relocation_chains--;
 }
 
 
 static void
-into_relocation_chain(current)
-Word current;
-{ Word head;
+into_relocation_chain(Word current, int stg)
+{ GET_LD
+  Word head;
   word val = get_value(current);
   
-  if ( isRef(val) )
-  { head = unRef(val);
-    set_value(current, get_value(head));
-    set_value(head, makeRef(current));
-    relocation_refs--;
-  } else if ( isIndirect(val) )
-  { head = (Word)unMask(val);
-    set_value(current, get_value(head));
-    set_value(head, (word)current | INDIRECT_MASK);
-    relocation_indirect--;
-  } else
-  { head = (Word) val;
-    set_value(current, get_value(head));
-    set_value(head, (word)current);
-  }
-  DEBUG(2, printf("Into relocation chain: 0x%lx (head = 0x%lx)\n", current, head));
+  head = valPtr(val);			/* FIRST/MASK already gone */
+  set_value(current, get_value(head));
+  set_value(head, consPtr(current, stg|tag(val)));
+
+  DEBUG(2, Sdprintf("Into relocation chain: 0x%p (head = 0x%p)\n",
+		    current, head));
 
   if ( is_first(head) )
     mark_first(current);
@@ -660,74 +906,126 @@ Word current;
   relocation_cells++;
 }
 
+
+static void
+alien_into_relocation_chain(void *addr, int orgst, int stg)
+{ GET_LD
+  void **ptr = (void **)addr;
+  
+  *ptr = (void *)consPtr(*ptr, orgst);
+  into_relocation_chain(addr, stg);
+
+  alien_relocations++;
+}
+
+
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Trail stack compacting.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 static void
-compact_trail()
-{ TrailEntry dest, current;
-  Lock l;
+compact_trail(void)
+{ GET_LD
+  GCTrailEntry dest, current;
   
-	/* get foreign references into the relocation chains */
-  for( l = pBase; l < pTop; l++ )
-  { if ( l->type == L_MARK )
-    { mark *m = (mark *) (l->value << 2);
-    
-      if ( m->trailtop > tTop )
-        sysError("Illegal trail mark from foreign code");
-
-      DEBUG(5, printf("Foreign mark: "));
-      needsRelocation((Word) &m->trailtop);
-      into_relocation_chain((Word) &m->trailtop);
-    }
-  }
-
 	/* compact the trail stack */
-  for( dest = current = tBase; current < tTop; )
-  { if ( is_first((Word) current) )
-      update_relocation_chain((Word) current, (Word) dest);
-#if O_DEBUG
+  for( dest = current = (GCTrailEntry)tBase; current < (GCTrailEntry)tTop; )
+  { if ( is_first(&current->address) )
+      update_relocation_chain(&current->address, &dest->address);
+#if O_SECURE
     else
     { Symbol s;
-      if ( (s=lookupHTable(check_table, current)) != NULL && s->value == TRUE )
-        sysError("0x%lx was supposed to be relocated (*= 0x%lx)",
+      if ( (s=lookupHTable(check_table, current)) != NULL &&
+	   s->value == (void *)TRUE )
+        sysError("0x%p was supposed to be relocated (*= 0x%p)",
 		 current, current->address);
     }
 #endif
 
-    if ( current->address != (Word) NULL )
+    if ( current->address )
       *dest++ = *current++;
     else
       current++;
   }
-  if ( is_first((Word) current) )
-    update_relocation_chain((Word) current, (Word) dest);
+  if ( is_first(&current->address) )
+    update_relocation_chain(&current->address, &dest->address);
 
-  tTop = dest;
+  tTop = (TrailEntry)dest;
 
   if ( relocated_cells != relocation_cells )
     sysError("After trail: relocation cells = %ld; relocated_cells = %ld\n",
-	relocation_cells, relocated_cells);
+	     relocation_cells, relocated_cells);
 } 
 
-static void
-sweep_mark(m)
-mark *m;
-{ Word gm, prev;
 
+static void
+tag_trail()
+{ GET_LD
+  TrailEntry te;
+
+  for(te = tBase; te < tTop; te++)
+  { if ( te->address )
+    { word mask = ttag(te->address);
+      int stg;
+
+      if ( onLocal(te->address) )
+	stg = STG_LOCAL;
+      else
+	stg = STG_GLOBAL;
+
+      te->address = (Word)consPtr(te->address, stg|mask);
+    }
+  }
+}
+
+
+static void
+untag_trail()
+{ GET_LD
+  TrailEntry te;
+
+  for(te = tBase; te < tTop; te++)
+  { if ( te->address )
+    { word mask = ttag(te->address);
+
+      te->address = (Word)((word)valPtr((word)te->address)|mask);
+    }
+  }
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Sweep a mark. This is a bit tricky as the global-stack pointer may point
+to  a  garbage  global  cell.  Therefore  we  have  to  find  the  first
+non-garbage one. Unfortunately, the cell may  already be in a relocation
+chain (in which case `first' is true). In  this case it is not a garbage
+cell. Hence the `goto found'.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static void
+sweep_mark(mark *m)
+{ GET_LD
+  Word gm, prev;
+
+  marks_swept++;
   gm = m->globaltop;
+
   for(;;)
   { if ( gm == gBase )
-    { m->globaltop = gm;
+    { m->globaltop = (Word)consPtr(gm, STG_GLOBAL);
+      alien_relocations++;
       break;
     }
+    if ( is_first(gm-1) )
+      goto found;
     prev = previous_gcell(gm);
     if ( marked(prev) )
-    { m->globaltop = gm;
-      DEBUG(2, printf("gTop mark from choice point: "));
-      needsRelocation((Word) &m->globaltop);
-      into_relocation_chain((Word) &m->globaltop);
+    {
+    found:
+      m->globaltop = gm, STG_GLOBAL;
+      DEBUG(3, Sdprintf("gTop mark from choice point: "));
+      needsRelocation(&m->globaltop);
+      alien_into_relocation_chain(&m->globaltop, STG_GLOBAL, STG_LOCAL);
       break;
     }
     gm = prev;
@@ -737,39 +1035,76 @@ mark *m;
 
 static void
 sweep_foreign()
-{ Lock l;
+{ GET_LD
+  FliFrame fr = fli_context;
 
-  for( l = pBase; l < pTop; l++ )
-  { switch( l->type )
-    { case L_WORD:
-	{ Word sp = (Word) (l->value << 2);
-	  
-	  unmark(sp);
-	  if ( isGlobalRef(get_value(sp)) )
-	  { DEBUG(5, printf("Foreign value: "));
-	    check_relocation(sp);
-	    into_relocation_chain(sp);
-	  }
-	  break;
-	}
-      case L_POINTER:
-	{ Word *sp = (Word *) (l->value << 2);
-	
-	  if ( marked(*sp) && isGlobalRef(get_value(*sp)) )
-	  { DEBUG(5, printf("Foreign pointer: "));
-	    check_relocation(*sp);
-	    into_relocation_chain(*sp);
-	  }
+  for( ; fr; fr = fr->parent )
+  { Word sp = refFliP(fr, 0);
+    int n = fr->size;
 
-	  break;
+    sweep_mark(&fr->mark);
+    for( ; n-- > 0; sp++ )
+    { if ( marked(sp) )
+      {	unmark(sp);
+	if ( isGlobalRef(get_value(sp)) )
+	{ local_marked--;
+	  check_relocation(sp);
+	  into_relocation_chain(sp, STG_LOCAL);
 	}
-      case L_MARK:
-	DEBUG(5, printf("Foreign mark: "));
-	sweep_mark((mark *) (l->value << 2));
-	break;
+      }
     }
   }
 }
+
+
+static void
+unsweep_mark(mark *m)
+{ GET_LD
+  m->trailtop  = (TrailEntry)valPtr2((word)m->trailtop,  STG_TRAIL);
+  m->globaltop = valPtr2((word)m->globaltop, STG_GLOBAL);
+
+  SECURE(check_mark(m));
+
+  marks_unswept++;
+}
+
+
+static void
+unsweep_foreign()
+{ GET_LD
+  FliFrame fr = fli_context;
+
+  for( ; fr; fr = fr->parent )
+    unsweep_mark(&fr->mark);
+}
+
+
+static void
+unsweep_choicepoints(Choice ch)
+{ for( ; ch ; ch = ch->parent)
+    unsweep_mark(&ch->mark);
+}
+
+
+static QueryFrame
+unsweep_environments(LocalFrame fr)
+{ while(fr->parent)
+    fr = fr->parent;
+
+  return (QueryFrame)addPointer(fr, -offset(queryFrame, frame));
+}
+
+
+static void
+unsweep_stacks(LocalFrame fr, Choice ch)
+{ QueryFrame query;
+
+  for( ; fr; fr = query->saved_environment, ch = query->saved_bfr )
+  { query = unsweep_environments(fr);
+    unsweep_choicepoints(ch);
+  }
+}
+
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Sweeping the local and trail stack to insert necessary pointers  in  the
@@ -777,35 +1112,45 @@ relocation chains.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 static void
-sweep_trail()
-{ register TrailEntry te = tTop - 1;
+sweep_trail(void)
+{ GET_LD
+  GCTrailEntry te = (GCTrailEntry)tTop - 1;
 
-  for( ; te >= tBase; te-- )
-  { if ( onGlobal(te->address) )
-    { needsRelocation((Word) &te->address);
-      into_relocation_chain((Word) &te->address);
+  for( ; te >= (GCTrailEntry)tBase; te-- )
+  { if ( te->address )
+    {
+#ifdef O_DESTRUCTIVE_ASSIGNMENT
+      if ( ttag(te->address) == TAG_TRAILVAL )
+      { needsRelocation(&te->address);
+	into_relocation_chain(&te->address, STG_TRAIL);
+      } else
+#endif
+      if ( storage(te->address) == STG_GLOBAL )
+      { needsRelocation(&te->address);
+	into_relocation_chain(&te->address, STG_TRAIL);
+      }
     }
   }
 }
 
 
-static LocalFrame
-sweep_environments(fr)
-LocalFrame fr;
-{ Code PC = NULL;
+static QueryFrame
+sweep_environments(LocalFrame fr, Code PC)
+{ GET_LD
 
-  if ( fr == (LocalFrame) NULL )
-    return (LocalFrame) NULL;
+  if ( !fr )
+    return NULL;
 
   for( ; ; )
   { int slots;
     Word sp;
 
     if ( false(fr, FR_MARKED) )
-      return (LocalFrame) NULL;
+      return NULL;
     clear(fr, FR_MARKED);
 
-    slots = (PC == NULL ? fr->procedure->functor->arity : slotsFrame(fr));
+    slots = (PC == NULL ? fr->predicate->functor->arity : slotsFrame(fr));
+
     sp = argFrameP(fr, 0);
     for( ; slots > 0; slots--, sp++ )
     { if ( marked(sp) )
@@ -813,7 +1158,7 @@ LocalFrame fr;
 	if ( isGlobalRef(get_value(sp)) )
 	{ local_marked--;
 	  check_relocation(sp);
-	  into_relocation_chain(sp);
+	  into_relocation_chain(sp, STG_LOCAL);
 	}
       }
     }
@@ -822,40 +1167,38 @@ LocalFrame fr;
     if ( fr->parent != NULL )
       fr = fr->parent;
     else
-      return parentFrame(fr);	/* Prolog --> C --> Prolog calls */
+      return (QueryFrame)addPointer(fr, -offset(queryFrame, frame));
   }
 }
 
 
 static void
-sweep_choicepoints(bfr)
-LocalFrame bfr;
-{ for( ; bfr != (LocalFrame)NULL; bfr = bfr->backtrackFrame )
-  { sweep_environments(bfr);
-    sweep_mark(&bfr->mark);
+sweep_choicepoints(Choice ch)
+{ for( ; ch ; ch = ch->parent)
+  { sweep_environments(ch->frame,
+		       ch->type == CHP_JUMP ? ch->value.PC : NULL);
+    sweep_mark(&ch->mark);
   }
 }
 
-static void
-sweep_stacks(fr)
-LocalFrame fr;
-{ LocalFrame pfr;
-
-  if ( (pfr = sweep_environments(fr)) != NULL )
-    sweep_stacks(pfr);
-
-  sweep_choicepoints(fr);
-}
-
 
 static void
-sweep_local(fr)
-LocalFrame fr;
-{ sweep_stacks(fr);
+sweep_stacks(LocalFrame fr, Choice ch)
+{ GET_LD
+  QueryFrame query;
+  
+  for( ; fr; fr = query->saved_environment, ch = query->saved_bfr )
+  { query = sweep_environments(fr, NULL);
+    sweep_choicepoints(ch);
+
+    if ( !query )			/* we've been here */
+      break;
+  }
 
   if ( local_marked != 0 )
     sysError("local_marked = %ld", local_marked);
 }
+
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 All preparations have been made now, and the actual  compacting  of  the
@@ -872,111 +1215,113 @@ size.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 static bool
-is_downward_ref(p)
-Word p;
-{ word val = get_value(p);
+is_downward_ref(Word p)
+{ GET_LD
+  word val = get_value(p);
 
-  if ( isRef(val) )
-  { DEBUG(5, if ( unRef(val) < p ) printf("REF: "));
-    return unRef(val) < p;
+  switch(tag(val))
+  { case TAG_INTEGER:
+      if ( storage(val) == STG_INLINE )
+	fail;
+    case TAG_STRING:
+    case TAG_FLOAT:
+    case TAG_REFERENCE:
+    case TAG_COMPOUND:
+      return val_ptr(val) < p;
   }
-  if ( isVar(val) || isInteger(val) )
-    fail;
-  if ( isIndirect(val) )
-  { DEBUG(5, if ( (Word)unMask(val) < p ) printf("INDIRECT: "));
-    return (Word)unMask(val) < p;
-  }
 
-  DEBUG(5, if ( (Word)val < p && (Word)val >= gBase ) printf("TERM: "));
-  if ( (Word)val < p && (Word)val >= gBase && !marked((Word)val) )
-    sysError("Pointer to term should be marked (down)");
-
-  return (Word)val < p && (Word)val >= gBase;
+  fail;
 }
+
 
 static bool
-is_upward_ref(p)
-Word p;
-{ word val = get_value(p);
+is_upward_ref(Word p)
+{ GET_LD
+  word val = get_value(p);
 
-  if ( isRef(val) )
-    return unRef(val) > p;
-  if ( isVar(val) || isInteger(val) )
-    fail;
-  if ( isIndirect(val) )
-    return (Word)unMask(val) > p;
+  switch(tag(val))
+  { case TAG_INTEGER:
+      if ( storage(val) == STG_INLINE )
+	fail;
+    case TAG_STRING:
+    case TAG_FLOAT:
+    case TAG_REFERENCE:
+    case TAG_COMPOUND:
+      return val_ptr(val) > p;
+  }
 
-  if ( (Word)val > p && (Word)val < gTop && !marked((Word)val) )
-    sysError("Pointer to term should be marked (up) \n\
-	     p = 0x%lx, val = 0x%lx, *val = 0x%lx, gTop = 0x%lx",
-	     p, val, *((Word)val), gTop);
-
-  return (Word)val > p && (Word)val < gTop;
+  fail;
 }
 
+
 static void
-compact_global()
-{ Word dest, current;
-#if O_DEBUG
+compact_global(void)
+{ GET_LD
+  Word dest, current;
+#if O_SECURE
   Word *v = mark_top;
 #endif
 
-  DEBUG(2, printf("Scanning global stack downwards\n"));
+  DEBUG(2, Sdprintf("Scanning global stack downwards\n"));
 
   dest = gBase + total_marked;			/* first FREE cell */
   for( current = gTop; current >= gBase; current-- )
-  { long offset = (marked(current) || is_first(current) ? 0
-						        : offset_cell(current));
+  { long offset = (marked(current) || is_first(current)
+		   			? 0 : offset_cell(current));
     current -= offset;
 
     if ( marked(current) )
     {
-#if O_DEBUG
+#if O_SECURE
       if ( current != *--v )
-        sysError("Marked cell at 0x%lx (*= 0x%lx); gTop = 0x%lx; should have been 0x%lx", current, *current, gTop, *v);
+        sysError("Marked cell at 0x%p (*= 0x%p); gTop = 0x%p; should be 0x%p",
+		 current, *current, gTop, *v);
 #endif
       dest -= offset + 1;
-      DEBUG(3, printf("Marked cell at 0x%lx (size = %ld; dest = 0x%lx)\n",
-						current, offset+1, dest));
-      update_relocation_chain(current, dest);
+      DEBUG(3, Sdprintf("Marked cell at 0x%p (size = %ld; dest = 0x%p)\n",
+			current, offset+1, dest));
+      if ( is_first(current) )
+	update_relocation_chain(current, dest);
       if ( is_downward_ref(current) )
       { check_relocation(current);
-	into_relocation_chain(current);
+	into_relocation_chain(current, STG_GLOBAL);
       }
     } else
-    { update_relocation_chain(current, dest);	/* gTop refs from marks */
+    { if ( is_first(current) )
+	update_relocation_chain(current, dest);	/* gTop refs from marks */
     }
   }
 
-#if O_DEBUG
+#if O_SECURE
   if ( v != mark_base )
   { for( v--; v >= mark_base; v-- )
-    { printf("Expected marked cell at 0x%lx, (*= 0x%lx)\n", *v, **v);
+    { Sdprintf("Expected marked cell at 0x%p, (*= 0x%lx)\n", *v, **v);
     }
-    sysError("v = 0x%lx; mark_base = 0x%lx", v, mark_base);
+    sysError("v = 0x%p; mark_base = 0x%p", v, mark_base);
   }
 #endif
 
   if ( dest != gBase )
-    sysError("Mismatch in down phase: dest = 0x%lx, gBase = 0x%lx\n",
-							dest, gBase);
+    sysError("Mismatch in down phase: dest = 0x%p, gBase = 0x%p\n",
+	     dest, gBase);
   if ( relocation_cells != relocated_cells )
     sysError("After down phase: relocation_cells = %ld; relocated_cells = %ld",
-					relocation_cells, relocated_cells);
+	     relocation_cells, relocated_cells);
 
-  DEBUG(2, printf("Scanning global stack upwards\n"));
+  DEBUG(2, Sdprintf("Scanning global stack upwards\n"));
   dest = gBase;
   for(current = gBase; current < gTop; )
   { if ( marked(current) )
     { long l, n;
 
-      update_relocation_chain(current, dest);
+      if ( is_first(current) )
+	update_relocation_chain(current, dest);
 
       if ( (l = offset_cell(current)) == 0 )	/* normal cells */
       { *dest = *current;
         if ( is_upward_ref(current) )
 	{ check_relocation(current);
-          into_relocation_chain(dest);
+          into_relocation_chain(dest, STG_GLOBAL);
 	}
 	unmark(dest);
 	dest++;
@@ -999,31 +1344,40 @@ compact_global()
   }
 
   if ( dest != gBase + total_marked )
-    sysError("Mismatch in up phase: dest = 0x%lx, gBase + total_marked = 0x%lx\n", dest, gBase + total_marked );
+    sysError("Mismatch in up phase: dest = 0x%p, gBase+total_marked = 0x%p\n",
+	     dest, gBase + total_marked );
+
+  DEBUG(3, { Word p = dest;		/* clear top of stack */
+	     while(p < gTop)
+	       *p++ = 0xbfbfbfbfL;
+	   });
 
   gTop = dest;
 }
 
 static void
-collect_phase(fr)
-LocalFrame fr;
-{ DEBUG(2, printf("Sweeping foreign references\n"));
+collect_phase(LocalFrame fr, Choice ch)
+{ GET_LD
+ 
+  DEBUG(2, Sdprintf("Sweeping foreign references\n"));
   sweep_foreign();
-  DEBUG(2, printf("Sweeping trail stack\n"));
+  DEBUG(2, Sdprintf("Sweeping trail stack\n"));
   sweep_trail();
-  DEBUG(2, printf("Sweeping local stack\n"));
-  sweep_local(fr);
-  DEBUG(2, printf("Compacting global stack\n"));
+  DEBUG(2, Sdprintf("Sweeping local stack\n"));
+  sweep_stacks(fr, ch);
+  DEBUG(2, Sdprintf("Compacting global stack\n"));
   compact_global();
+
+  unsweep_foreign();
+  unsweep_stacks(fr, ch);
 
   if ( relocation_chains != 0 )
     sysError("relocation chains = %ld", relocation_chains);
   if ( relocated_cells != relocation_cells ||
-       relocated_cells != needs_relocation ||
-       relocation_refs != 0 || relocation_indirect != 0)
-    sysError("relocation cells = %ld; relocated_cells = %ld, needs_relocation = %ld\n\trelocation_refs = %ld, relocation_indirect = %ld",
-	relocation_cells, relocated_cells, needs_relocation,
-	relocation_refs, relocation_indirect);
+       relocated_cells != needs_relocation )
+    sysError("relocation cells = %ld; relocated_cells = %ld, "
+	     "needs_relocation = %ld\n\t",
+	     relocation_cells, relocated_cells, needs_relocation);
 }
 
 
@@ -1031,74 +1385,52 @@ LocalFrame fr;
 		*             MAIN              *
 		*********************************/
 
-static long gsmall = 200000L;
-static long tsmall = 100000L;
-
-word
-pl_collect_parms(g, t)
-Word g, t;
-{ if ( !isInteger(*g) || !isInteger(*t) )
-    return warning("$collect_parms/2: instantiation fault");
-
-  gsmall = valNum(*g);
-  tsmall = valNum(*t);
-
-  succeed;
-}
-
-
 #if O_DYNAMIC_STACKS
 void
-considerGarbageCollect(s)
-Stack s;
-{ if ( s == (Stack) &stacks.global )
-  { Word gsegb = (gc_status.segment ? gc_status.segment->mark.globaltop
-				    : gBase);
-    if ( s->max - (caddress)gsegb > (caddress)gsegb - s->base + gsmall )
-    { DEBUG(1, printf("Global overflow: Posted garbage collect request\n"));
-      gc_status.requested = TRUE;
-#if O_PROFILE
-      PROCEDURE_garbage_collect0->definition->profile_calls++;
-#endif
-    }
-  }
+considerGarbageCollect(Stack s)
+{ GET_LD
+  if ( s->gc && trueFeature(GC_FEATURE) && !gc_status.requested )
+  { long used  = (char *)s->top   - (char *)s->base;
+    long free  = (char *)s->limit - (char *)s->top;
+    long limit = (char *)s->limit - (char *)s->base;
 
-  if ( s == (Stack) &stacks.trail )
-  { TrailEntry tsegb = (gc_status.segment ? gc_status.segment->mark.trailtop
-					  : tBase);
-    if ( s->max - (caddress)tsegb > (caddress)tsegb - s->base + tsmall )
-    { DEBUG(1, printf("Trail overflow: Posted garbage collect request\n"));
-      gc_status.requested = TRUE;
-#if O_PROFILE
-      PROCEDURE_garbage_collect0->definition->profile_calls++;
-#endif
+    if ( used > s->factor*s->gced_size + s->small )
+    { gc_status.requested = TRUE;
+    } else if ( free < limit/8 && used > s->gced_size + limit/32 ) 
+    { gc_status.requested = TRUE;
     }
+
+    DEBUG(1, if ( gc_status.requested)
+	     { Sdprintf("%s overflow: Posted garbage collect request\n",
+			s->name);
+	     });
   }
 }
 #endif /* O_DYNAMIC_STACKS */
 
-#if O_DEBUG
+
+#if O_SECURE || O_DEBUG || defined(O_MAINTENANCE)
 static bool
-scan_global()
-{ Word current;
+scan_global(int marked)
+{ GET_LD
+  Word current;
   int errors = 0;
   long cells = 0;
 
   for( current = gBase; current < gTop; current += (offset_cell(current)+1) )
   { cells++;
-    if ( (Word)(*current) >= gBase && (Word)(*current) < gTop )
-      if ( !isTerm(*current) )
-        sysError("Pointer on global stack is not a term");
-    if ( marked(current) || is_first(current) )
-    { warning("Illegal cell in global stack (up) at 0x%lx (*= 0x%lx)", current, *current);
+    if ( (!marked && marked(current)) || is_first(current) )
+    { warning("Illegal cell in global stack (up) at 0x%p (*= 0x%p)",
+	      current, *current);
       if ( isAtom(*current) )
-	warning("0x%lx is atom %s", current, stringAtom(*current));
+	warning("0x%p is atom %s", current, stringAtom(*current));
       if ( isTerm(*current) )
-	warning("0x%lx is term %s/%d", current,
-				       stringAtom(functorTerm(*current)->name),
-				       functorTerm(*current)->arity);
+	warning("0x%p is term %s/%d",
+		current,
+		stringAtom(nameFunctor(functorTerm(*current))),
+		arityTerm(*current));
       if ( ++errors > 10 )
-      { printf("...\n");
+      { Sdprintf("...\n");
         break;
       }
     }
@@ -1107,10 +1439,11 @@ scan_global()
   for( current = gTop - 1; current >= gBase; current-- )
   { cells --;
     current -= offset_cell(current);
-    if ( marked(current) || is_first(current) )
-    { warning("Illegal cell in global stack (down) at 0x%lx (*= 0x%lx)", current, *current);
+    if ( (!marked && marked(current)) || is_first(current) )
+    { warning("Illegal cell in global stack (down) at 0x%p (*= 0x%p)",
+	      current, *current);
       if ( ++errors > 10 )
-      { printf("...\n");
+      { Sdprintf("...\n");
         break;
       }
     }
@@ -1121,29 +1454,203 @@ scan_global()
 
   return errors == 0;
 }
+
+
+static word key;
+static int checked;
+
+static void
+check_mark(mark *m)
+{ GET_LD
+
+  assert(onStackArea(trail,  m->trailtop));
+  assert(onStackArea(global, m->globaltop));
+}
+
+
+static QueryFrame
+check_environments(LocalFrame fr, Code PC)
+{ GET_LD
+
+  if ( fr == NULL )
+    return NULL;
+
+  for(;;)
+  { int slots, n;
+    Word sp;
+
+    if ( true(fr, FR_MARKED) )
+      return NULL;			/* from choicepoints only */
+    set(fr, FR_MARKED);
+    local_frames++;
+    clearUninitialisedVarsFrame(fr, PC);
+
+    assert(onStack(local, fr));
+
+    DEBUG(3, Sdprintf("Check [%ld] %s:",
+		      levelFrame(fr),
+		      predicateName(fr->predicate)));
+
+    slots   = (PC == NULL ? fr->predicate->functor->arity : slotsFrame(fr));
+    sp = argFrameP(fr, 0);
+    for( n=0; n < slots; n++ )
+    { key += checkData(&sp[n]);
+    }
+    checked += slots;
+    DEBUG(3, Sdprintf(" 0x%lx\n", key));
+
+    PC = fr->programPointer;
+    if ( fr->parent )
+      fr = fr->parent;
+    else
+    { QueryFrame qf = (QueryFrame)addPointer(fr, -offset(queryFrame, frame));
+      DEBUG(3, Sdprintf("*** Query %s\n", predicateName(qf->frame.predicate)));
+      return qf;
+    }
+  }
+}
+
+
+static void
+check_choicepoints(Choice ch)
+{ GET_LD
+
+  for( ; ch; ch = ch->parent )
+  { if ( !ch->parent )
+      assert(ch->type == CHP_TOP);
+    choice_count++;
+    check_mark(&ch->mark);
+    check_environments(ch->frame,
+		       ch->type == CHP_JUMP ? ch->value.PC : NULL);
+  }
+}
+
+
+word
+check_foreign()
+{ GET_LD
+  FliFrame ff;
+  word key = 0L;
+
+  for(ff = fli_context; ff; ff = ff->parent )
+  { Word sp = refFliP(ff, 0);
+    int n = ff->size;
+
+    for(n=0 ; n < ff->size; n++ )
+      key += checkData(&sp[n]);
+
+    check_mark(&ff->mark);
+  }
+
+  return key;
+}
+
+
+#ifdef O_DESTRUCTIVE_ASSIGNMENT
+static word
+check_trail()
+{ GET_LD
+  TrailEntry te = tTop - 1;
+  word key = 0;
+
+  for( ; te >= tBase; te-- )
+  { Word gp;
+
+    if ( isTrailVal(te->address) )
+    { gp = trailValP(te->address);
+
+      assert(onGlobal(gp));
+      key += checkData(gp);
+    }
+  }
+
+  return key;
+}
+#endif /*O_DESTRUCTIVE_ASSIGNMENT*/
+
+
+word
+checkStacks(LocalFrame frame, Choice choice)
+{ GET_LD
+  LocalFrame fr;
+  Choice ch;
+  QueryFrame qf;
+
+  if ( !frame )
+    frame = environment_frame;
+  if ( !choice )
+    choice = LD->choicepoints;
+
+  local_frames = 0;
+  choice_count = 0;
+  key = 0L;
+
+  for( fr = frame, ch=choice;
+       fr;
+       fr = qf->saved_environment, ch = qf->saved_bfr )
+  { qf = check_environments(fr, NULL);
+    assert(qf->magic == QID_MAGIC);
+
+    check_choicepoints(ch);
+  }
+
+  SECURE(trailtops_marked = choice_count);
+
+  unmark_stacks(LD, frame, choice);
+
+  assert(local_frames == 0);
+  assert(choice_count == 0);
+
+  key += check_foreign();
+#ifdef O_DESTRUCTIVE_ASSIGNMENT
+  key += check_trail();
 #endif
+
+  return key;
+}
+
+#endif /*O_SECURE || O_DEBUG*/
 
 
 void
-garbageCollect(fr)
-LocalFrame fr;
-{ long tgar, ggar;
+garbageCollect(LocalFrame fr, Choice ch)
+{ GET_LD
+  long tgar, ggar;
   real t = CpuTime();
+  int verbose = trueFeature(TRACE_GC_FEATURE);
+  sigset_t mask;
 
-  if ( gc_status.blocked )
+  DEBUG(0, verbose = TRUE);
+
+  if ( gc_status.blocked || !trueFeature(GC_FEATURE) )
     return;
-  gc_status.requested = FALSE;
+  blockGC();				/* avoid recursion due to */
+  gc_status.requested = FALSE;		/* printMessage() */
 
   gc_status.active = TRUE;
-  DEBUG(0, printf("Garbage collect ... "));
-#if O_DEBUG
-  if ( !scan_global() )
+  finish_foreign_frame(PASS_LD1);
+  if ( verbose )
+    printMessage(ATOM_informational,
+		 PL_FUNCTOR_CHARS, "gc", 1,
+		   PL_CHARS, "start");
+
+  blockSignals(&mask);
+
+#ifdef O_PROFILE
+  PROCEDURE_garbage_collect0->definition->profile_calls++;
+#endif
+#if O_SECURE
+  if ( !scan_global(FALSE) )
     sysError("Stack not ok at gc entry");
+
+  key = checkStacks(fr, ch);
 
   if ( check_table == NULL )
     check_table = newHTable(256);
   else
     clearHTable(check_table);
+
+  mark_base = mark_top = malloc(usedStack(global));
 #endif
 
   needs_relocation  = 0;
@@ -1151,129 +1658,673 @@ LocalFrame fr;
   relocation_cells  = 0;
   relocated_cells   = 0;
   local_marked	    = 0;
-  relocation_refs   = 0;
-  relocation_indirect = 0;
 
-  STACKVERIFY( if ( gTop + 1 >= gMax ) outOf((Stack) &stacks.global) );
+  requireStack(global, sizeof(word));
+  requireStack(trail, sizeof(struct trail_entry));
   setVar(*gTop);
-  STACKVERIFY( if ( tTop + 1 >= tMax ) outOf((Stack) &stacks.trail) );
-  tTop->address = NULL;
+  tTop->address = 0;
 
-  mark_phase(fr);
+  tag_trail();
+  mark_phase(fr, ch);
   tgar = trailcells_deleted * sizeof(struct trail_entry);
   ggar = (gTop - gBase - total_marked) * sizeof(word);
   gc_status.trail_gained  += tgar;
   gc_status.global_gained += ggar;
   gc_status.collections++;
-  gc_status.segment = fr;
 
-  DEBUG(2, printf("Compacting trail ... "));
+  DEBUG(2, Sdprintf("Compacting trail ... "));
   compact_trail();
 
-  collect_phase(fr);
-#if O_DEBUG
-  if ( !scan_global() )
-    sysError("Stack not ok after gc; gTop = 0x%lx", gTop);
+  collect_phase(fr, ch);
+  untag_trail();
+#if O_SECURE
+  assert(trailtops_marked == 0);
+  if ( !scan_global(FALSE) )
+    sysError("Stack not ok after gc; gTop = 0x%p", gTop);
+  free(mark_base);
 #endif
-  DEBUG(0, printf("gained %ld+%ld bytes (now: %ld+%ld bytes)\n",
-			  ggar, tgar,
-			  (gTop-gBase)*sizeof(word),
-			  (tTop-tBase)*sizeof(word)));
-  gc_status.time += CpuTime() - t;
 
-  pl_trim_stacks();
+  t = CpuTime() - t;
+  gc_status.time += t;
+  trimStacks();
+  LD->stacks.global.gced_size = usedStack(global);
+  LD->stacks.trail.gced_size  = usedStack(trail);
   gc_status.active = FALSE;
+  unblockSignals(&mask);
+
+  SECURE(if ( checkStacks(fr, ch) != key )
+	 { Sdprintf("Stack checksum failure\n");
+	   trap_gdb();
+	 } else
+	   Sdprintf("(OK) "));
+
+  if ( verbose )
+    printMessage(ATOM_informational,
+		 PL_FUNCTOR_CHARS, "gc", 1,
+		   PL_FUNCTOR_CHARS, "done", 7,
+		     PL_LONG, ggar,
+		     PL_LONG, tgar,
+		     PL_DOUBLE, (double)t,
+		     PL_LONG, usedStack(global),
+		     PL_LONG, usedStack(trail),
+		     PL_LONG, roomStack(global),
+		     PL_LONG, roomStack(trail));
+  unblockGC();
 }
 
 word
-pl_garbage_collect(d)
-Word d;
-{ LocalFrame fr = environment_frame;
-#if O_DEBUG
-  int ol = status.debugLevel;
+pl_garbage_collect(term_t d)
+{ GET_LD
+  LocalFrame fr = environment_frame;
+  Choice ch = LD->choicepoints;
 
-  if ( !isInteger(*d) )
-    return warning("garbage_collect/1: instantiation fault");
-  status.debugLevel = (int) valNum(*d);
-#endif
-  gc_status.blocked--;
-  garbageCollect(fr);
-  gc_status.blocked++;
 #if O_DEBUG
-  status.debugLevel = ol;
+  int ol = GD->debug_level;
+  int nl;
+
+  if ( !PL_get_integer(d, &nl) )
+    return warning("garbage_collect/1: instantiation fault");
+  GD->debug_level = nl;
+#endif
+  finish_foreign_frame(PASS_LD1);
+  garbageCollect(fr, ch);
+#if O_DEBUG
+  GD->debug_level = ol;
 #endif
   succeed;
 }
 
+
 void
-resetGC()
-{ gc_status.requested = FALSE;
-  gc_status.blocked = 0;
-  gc_status.segment = NULL;
-  gc_status.collections = gc_status.global_gained = gc_status.trail_gained = 0;
-  gc_status.time = 0.0;
+blockGC()
+{ GET_LD
+  gc_status.blocked++;
+#if O_SHIFT_STACKS
+  shift_status.blocked++;
+#endif
 }
 
-		/********************************
-		*      LOCKING FOREIGN DATA     *
-		*********************************/
+
+void
+unblockGC()
+{ GET_LD
+  gc_status.blocked--;
+#if O_SHIFT_STACKS
+  shift_status.blocked--;
+#endif
+}
+
+
+#if O_SHIFT_STACKS
+
+		 /*******************************
+		 *	   STACK-SHIFTER	*
+		 *******************************/
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-There are various types of foreign data that  are  of  interest  to  the
-garbage  collector.  First of all the internal code both supports `word'
-and `Word'.  Both can refer to the stacks.  Their value  is  non-garbage
-and  should  be  relocated similar to local stack variables.  Second are
-marks (Mark() and Undo()). Marks kept by foreign code should be  treated
-equal to marks kept in the choicepoints on the local stack.
+Update the Prolog runtime stacks presuming they have shifted by the
+the specified offset.
+
+Memory management description.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-void
-lockw(p)
-Word p;
-{ Lock l = pTop++;
+static inline void
+update_pointer(void *p, long offset)
+{ GET_LD
+  char **ptr = ((char **)p);
 
-  verifyStack(lock);
-  l->type  = L_WORD;
-  l->value = (unsigned) p >> 2;
+  if ( *ptr )
+    *ptr += offset;
 }
 
-void
-lockp(p)
-Word *p;
-{ Lock l = pTop++;
 
-  verifyStack(lock);
-  l->type  = L_POINTER;
-  l->value = (unsigned) p >> 2;
+		 /*******************************
+		 *	   LOCAL STACK		*
+		 *******************************/
+
+static void
+update_mark(mark *m, long gs, long ts)
+{ GET_LD
+
+  if ( ts ) update_pointer(&m->trailtop, ts);
+  if ( gs ) update_pointer(&m->globaltop, gs);
 }
+
+
+static QueryFrame
+update_environments(LocalFrame fr, Code PC, long ls, long gs, long ts)
+{ GET_LD
+  if ( fr == NULL )
+    return NULL;
+
+  for(;;)
+  { int slots;
+    Word sp;
+    
+    assert(inShiftedArea(local, ls, fr));
+
+    if ( true(fr, FR_MARKED) )
+      return NULL;			/* from choicepoints only */
+    set(fr, FR_MARKED);
+    local_frames++;
+    
+    DEBUG(2,
+	  Sdprintf("Shifting frame 0x%p [%ld] %s ... ",
+		 fr, levelFrame(fr), predicateName(fr->predicate)));
+
+    if ( ls )				/* update frame pointers */
+    { update_pointer(&fr->parent, ls);
+      clearUninitialisedVarsFrame(fr, PC);
+
+      slots = (PC == NULL ? fr->predicate->functor->arity : slotsFrame(fr));
+      sp = argFrameP(fr, slots);
+					/* update saved BFR's from C_MARK */
+      if ( ls && PC && false(fr->predicate, FOREIGN) )
+      { Clause cl = fr->clause->clause;
+	int saved_bfrs = cl->variables - cl->prolog_vars;
+	
+	for( ; saved_bfrs-- > 0; sp++ )
+	  update_pointer(sp, ls);
+      }
+    }
+
+    DEBUG(2, Sdprintf("ok\n"));
+
+    PC = fr->programPointer;
+    if ( fr->parent )
+      fr = fr->parent;
+    else				/* Prolog --> C --> Prolog calls */
+    { QueryFrame query = (QueryFrame)addPointer(fr, -offset(queryFrame,frame));
+
+      if ( ls )
+      { update_pointer(&query->saved_bfr, ls);
+	update_pointer(&query->saved_environment, ls);
+	update_pointer(&query->registers.fr, ls);
+      }
+      
+      return query;
+    }
+  }
+}
+
+
+static void
+update_choicepoints(Choice ch, long ls, long gs, long ts)
+{ GET_LD
+
+  for( ; ch; ch = ch->parent )
+  { DEBUG(1, Sdprintf("Updating choicepoints from 0x%p [%ld] %s ... ",
+		      ch,
+		      levelFrame(ch->frame),
+		      predicateName(ch->frame->predicate)));
+
+    if ( ls )
+    { update_pointer(&ch->frame, ls);
+      update_pointer(&ch->parent, ls);
+    }
+    update_mark(&ch->mark, gs, ts);
+    update_environments(ch->frame,
+		        ch->type == CHP_JUMP ? ch->value.PC : NULL,
+			ls, gs, ts);
+    choice_count++;
+  }
+}
+
+
+		 /*******************************
+		 *	  ARGUMENT STACK	*
+		 *******************************/
+
+static void
+update_argument(long ls, long gs)
+{ GET_LD
+  Word *p = aBase;
+  Word *t = aTop;
+
+  for( ; p < t; p++ )
+  { if ( onGlobal(*p) )
+    { *p = addPointer(*p, gs);
+    } else
+    { assert(onLocal(*p));
+      *p = addPointer(*p, ls);
+    }
+  }
+}
+
+
+		 /*******************************
+		 *	  TRAIL STACK	*
+		 *******************************/
+
+static void
+update_trail(long ls, long gs)
+{ GET_LD
+  TrailEntry p = tBase;
+  TrailEntry t = tTop;
+
+  for( ; p < t; p++ )
+  { if ( onGlobal(trailValP(p->address)) )
+    { update_pointer(&p->address, gs);
+    } else
+    { assert(onLocal(p->address));
+      update_pointer(&p->address, ls);
+    }
+  }
+}
+
+
+		 /*******************************
+		 *	  FOREIGN FRAMES	*
+		 *******************************/
+
+static void
+update_foreign(long ts, long ls, long gs)
+{ GET_LD
+  FliFrame fr = addPointer(fli_context, ls);
+
+  for( ; fr; fr = fr->parent )
+  { update_mark(&fr->mark, gs, ts);
+    update_pointer(&fr->parent, ls);
+  }
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Entry-point.   Update the  stacks to  reflect  their current  positions.
+This function should be called *after*  the  stacks have been relocated.
+Note that these functions are  only used  if  there is no virtual memory
+way to reach at dynamic stacks.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#define updateStackHeader(name, offset) \
+	{ LD->stacks.name.base  = addPointer(LD->stacks.name.base,  offset); \
+	  LD->stacks.name.top   = addPointer(LD->stacks.name.top,   offset); \
+	  LD->stacks.name.max   = addPointer(LD->stacks.name.max,   offset); \
+	  LD->stacks.name.limit = addPointer(LD->stacks.name.limit, offset); \
+	}
+
+
+static void
+update_stacks(LocalFrame frame, Choice choice, Code PC,
+	      void *lb, void *gb, void *tb)
+{ GET_LD
+  long ls, gs, ts;
+
+  ls = (long) lb - (long) lBase;
+  gs = (long) gb - (long) gBase;
+  ts = (long) tb - (long) tBase;
+
+  DEBUG(2, Sdprintf("ls+gs+ts = %ld %ld %ld ... ", ls, gs, ts));
+
+  if ( ls || gs || ts )
+  { LocalFrame fr;
+    Choice ch;
+    QueryFrame qf;
+
+    local_frames = 0;
+    choice_count = 0;
+    
+    for( fr = addPointer(frame, ls),
+	 ch = addPointer(choice, ls)
+       ; fr
+       ; fr = qf->saved_environment,
+	 ch = qf->saved_bfr,
+	 PC = NULL
+       )
+    { qf = update_environments(fr, PC, ls, gs, ts);
+
+      update_choicepoints(ch, ls, gs, ts);
+    }
+
+    DEBUG(2, Sdprintf("%d frames, %d choice-points ...",
+		      local_frames, choice_count));
+
+    frame  = addPointer(frame, ls);
+    choice = addPointer(choice, ls);
+    unmark_stacks(LD, frame, choice);
+
+    assert(local_frames == 0);
+    assert(choice_count == 0);
+
+    if ( gs || ls )
+    { update_argument(ls, gs);
+      update_trail(ls, gs);
+    }
+    update_foreign(ts, ls, gs);
+
+    updateStackHeader(local,  ls);
+    updateStackHeader(global, gs);
+    updateStackHeader(trail,  ts);
+
+    base_addresses[STG_LOCAL]  = (unsigned long)lBase;
+    base_addresses[STG_GLOBAL] = (unsigned long)gBase;
+    base_addresses[STG_TRAIL]  = (unsigned long)tBase;
+  }
+
+  if ( ls )
+  { update_pointer(&environment_frame, ls);
+    update_pointer(&fli_context, ls);
+    update_pointer(&LD->choicepoints, ls);
+  }
+  if ( gs )
+  { update_pointer(&LD->mark_bar, gs);
+  } 
+}
+
+
+static long
+nextStackSize(Stack s)
+{ GET_LD
+  long size  = diffPointers(s->max, s->base);
+  long grow  = ROUND(size/2, 8192);
+  long limit = diffPointers(s->limit, s->base);
+
+  if ( size + grow > limit )
+  { if ( size + grow > (limit*3)/2 )
+      outOfStack(s, STACK_OVERFLOW_SIGNAL_IMMEDIATELY);
+
+    outOfStack(s, STACK_OVERFLOW_SIGNAL);
+    grow = limit - size;
+    if ( grow < 32 * 1024 )
+      grow = 32 * 1024;
+    s->limit = addPointer(s->base, size+grow);
+  }
+
+  size += grow;
+
+  return size;
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Entry point from interpret()
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#define GL_SEPARATION sizeof(word)
+
+int
+growStacks(LocalFrame fr, Choice ch, Code PC, int l, int g, int t)
+{ GET_LD
+  if ( fr == NULL || PC != NULL )	/* for now, only at the call-port */
+    fail;
+
+  if ( (l || g || t) && !shift_status.blocked )
+  { TrailEntry tb = tBase;
+    Word gb = gBase;
+    LocalFrame lb = lBase;
+    long lsize = sizeStack(local);
+    long gsize = sizeStack(global);
+    long tsize = sizeStack(trail);
+    real time = CpuTime();
+    int verbose = trueFeature(TRACE_GC_FEATURE);
+    
+    DEBUG(0, verbose = TRUE);
+
+    if ( verbose )
+    { int i = 0;
+
+      Sdprintf("Expanding ");
+      if ( l ) Sdprintf("%s%s", i++ ? "and " : "", "local ");
+      if ( g ) Sdprintf("%s%s", i++ ? "and " : "", "global ");
+      if ( t ) Sdprintf("%s%s", i++ ? "and " : "", "trail ");
+      Sdprintf("stacks ");
+    }
+
+    finish_foreign_frame(PASS_LD1);
+
+    if ( !fr )
+      fr = environment_frame;
+    if ( !ch )
+      ch = LD->choicepoints;
+
+    SECURE(key = checkStacks(fr, ch));
+
+    if ( t )
+    { tsize = nextStackSize((Stack) &LD->stacks.trail);
+      tb = xrealloc(tb, tsize);
+      shift_status.trail_shifts++;
+    }
+
+    if ( g || l )
+    { long loffset = gsize + GL_SEPARATION;
+      assert(lb == addPointer(gb, loffset));	
+
+      if ( g )
+      { gsize = nextStackSize((Stack) &LD->stacks.global);
+	shift_status.global_shifts++;
+      }
+      if ( l )
+      { lsize = nextStackSize((Stack) &LD->stacks.local);
+	shift_status.local_shifts++;
+      }
+
+      gb = xrealloc(gb, lsize + gsize + GL_SEPARATION);
+      lb = addPointer(gb, gsize + GL_SEPARATION);
+      if ( g )				/* global enlarged; move local */
+	memmove(lb,   addPointer(gb, loffset), lsize);
+	     /* dest, src,                     size */
+    }
+      
+    if ( verbose )
+    { Sdprintf("to (l+g+t) = %d+%d+%d Kbytes ... ",
+	   lsize / 1024,
+	   gsize / 1024,
+	   tsize / 1024);
+    }
+
+#define PrintStackParms(stack, name, newbase, newsize) \
+	{ Sdprintf("%6s: 0x%08lx ... 0x%08lx --> 0x%08lx ... 0x%08lx\n", \
+		 name, \
+		 (unsigned long) LD->stacks.stack.base, \
+		 (unsigned long) LD->stacks.stack.max, \
+		 (unsigned long) newbase, \
+		 (unsigned long) addPointer(newbase, newsize)); \
+	}
+
+
+    DEBUG(0, { Sputchar('\n');
+	       PrintStackParms(global, "global", gb, gsize);
+	       PrintStackParms(local, "local", lb, lsize);
+	       PrintStackParms(trail, "trail", tb, tsize);
+	     });
+		    
+    DEBUG(1, Sdprintf("Updating stacks ..."));
+    update_stacks(fr, ch, PC, lb, gb, tb);
+
+    LD->stacks.local.max  = addPointer(LD->stacks.local.base,  lsize);
+    LD->stacks.global.max = addPointer(LD->stacks.global.base, gsize);
+    LD->stacks.trail.max  = addPointer(LD->stacks.trail.base,  tsize);
+
+    SetHTop(LD->stacks.local.max);
+    SetHTop(LD->stacks.trail.max);
+
+    time = CpuTime() - time;
+    shift_status.time += time;
+    SECURE(if ( checkStacks(NULL, NULL) != key )
+	   { Sdprintf("Stack checksum failure\n");
+	     trap_gdb();
+	   });
+    if ( verbose )
+    { Sdprintf("%.2f sec.\n", time);
+    }
+
+    succeed;
+  }
+
+  fail;
+}
+
+#endif /*O_SHIFT_STACKS*/
+
+#ifdef O_ATOMGC
+
+		 /*******************************
+		 *	      ATOM-GC		*
+		 *******************************/
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+The  routine  markAtomsOnStacks(PL_local_data_t  *ld)  marks  all  atoms
+reachable  from  the  global  stack,    environments,  choicepoints  and
+term-references  using  markAtom().  It  is    designed   to  allow  for
+asynchronous calling, even from different   threads (hence the argument,
+although the thread examined should be stopped). 
+
+Asynchronous calling is in general not  possible,   but  here we make an
+exception. markAtom() is supposed  to  test   for  and  silently  ignore
+non-atoms. Basically, this implies we can   mark a few atoms incorrectly
+from the interrupted frame, but in   the context of multi-threading this
+is a small price to pay.
+
+Otherwise  this  routine  is  fairly  trivial.   It  is  modelled  after
+checkStacks(), a simple routine for  checking stack-consistency that has
+to walk along all reachable data as well.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#ifdef O_DEBUG_ATOMGC
+extern IOSTREAM * atomLogFd;		/* for error messages */
+
+static long
+loffset(void *p)
+{ if ( p == NULL )
+    return 0;
+
+  assert((long)p % sizeof(word) == 0);
+  return (Word)p-(Word)lBase;
+}
+#endif
+
+static void
+markAtomsOnGlobalStack(PL_local_data_t *ld)
+{ Word gbase = ld->stacks.global.base;
+  Word gtop  = ld->stacks.global.top;
+  Word current;
+
+  for(current = gbase; current < gtop; current += (offset_cell(current)+1) )
+  { if ( isAtom(*current) )
+      markAtom(*current);
+  }
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+This is much like  check_environments(),  but   as  we  might  be called
+asynchronously, we have to be a bit careful about the first frame (if PC
+== NULL). The interpreter will  set  the   clause  field  to NULL before
+opening the frame, and we only have   to  consider the arguments. If the
+frame has a clause we must consider all variables of this clause.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static QueryFrame
+mark_atoms_in_environments(PL_local_data_t *ld, LocalFrame fr)
+{ Code PC = NULL;
+
+  if ( fr == NULL )
+    return NULL;
+
+  for(;;)
+  { int slots, n;
+    Word sp;
+
+    if ( true(fr, FR_MARKED) )
+      return NULL;			/* from choicepoints only */
+    set(fr, FR_MARKED);
+#ifdef O_DEBUG_ATOMGC
+    if ( atomLogFd )
+      Sfprintf(atomLogFd,
+	       "Marking atoms from [%d] %s\n",
+	       levelFrame(fr),
+	       predicateName(fr->predicate));
+#endif
+    ld->gc._local_frames++;
+    clearUninitialisedVarsFrame(fr, PC);
+
+    if ( true(fr->predicate, FOREIGN) ||
+	 !fr->clause )
+      slots = fr->predicate->functor->arity;
+    else
+      slots = fr->clause->clause->prolog_vars;
+
+    sp = argFrameP(fr, 0);
+    for( n=0; n < slots; n++, sp++ )
+    { if ( isAtom(*sp) )
+	markAtom(*sp);
+    }
+
+    PC = fr->programPointer;
+    if ( fr->parent )
+      fr = fr->parent;
+    else
+    { QueryFrame qf = (QueryFrame)addPointer(fr, -offset(queryFrame, frame));
+      return qf;
+    }
+  }
+}
+
+
+static void
+markAtomsInTermReferences(PL_local_data_t *ld)
+{ FliFrame   ff = ld->foreign_environment;
+  LocalFrame fr = ld->environment;
   
-void
-lockMark(m)
-mark *m;
-{ Lock l = pTop++;
+					/* see finish_foreign_frame() */
+  if ( (void *)fr < (void *)ff )
+  { Word ltop = (Word)ld->stacks.local.top;
+    
+    ff->size = ltop - (Word)addPointer(ff, sizeof(struct fliFrame));
+  }
+  
+  for(; ff; ff = ff->parent )
+  { Word sp = refFliP(ff, 0);
+    int n = ff->size;
 
-  verifyStack(lock);
-  l->type  = L_MARK;
-  l->value = (unsigned) m >> 2;
+    for(n=0 ; n < ff->size; n++ )
+    { if ( isAtom(sp[n]) )
+	markAtom(sp[n]);
+    }
+  }
 }
 
-void
-unlockw(p)
-Word p;
-{ if ( ((--pTop)->value << 2) != (unsigned)p )
-    sysError("Mismatch in lock()/unlock()\n");
+
+static void
+markAtomsInEnvironments(PL_local_data_t *ld)
+{ QueryFrame qf;
+  LocalFrame fr;
+  Choice ch;
+
+  ld->gc._local_frames = 0;
+
+  for( fr = ld->environment,
+       ch = ld->choicepoints
+     ; fr
+     ; fr = qf->saved_environment,
+       ch = qf->saved_bfr
+     )
+  { qf = mark_atoms_in_environments(ld, fr);
+    assert(qf->magic == QID_MAGIC);
+
+    for(; ch; ch = ch->parent)
+    {
+#ifdef O_DEBUG_ATOMGC
+      if ( atomLogFd )
+	Sfprintf(atomLogFd, "Marking atoms from choicepoint #%ld on %s\n",
+		 local(ch), predicateName(ch->frame->predicate));
+#endif
+      mark_atoms_in_environments(ld, ch->frame);
+    }
+  }
+
+  unmark_stacks(ld, ld->environment, ld->choicepoints);
+
+  assert(ld->gc._local_frames == 0);
 }
 
-void
-unlockp(p)
-Word *p;
-{ if ( ((--pTop)->value << 2) != (unsigned)p )
-    sysError("Mismatch in lock()/unlock()\n");
-}
 
 void
-unlockMark(m)
-mark *m;
-{ if ( ((--pTop)->value << 2) != (unsigned)m )
-    sysError("Mismatch in lock()/unlock()\n");
+markAtomsOnStacks(PL_local_data_t *ld)
+{ markAtomsOnGlobalStack(ld);
+  markAtomsInEnvironments(ld);
+  markAtomsInTermReferences(ld);
 }
+
+#endif /*O_ATOMGC*/
+

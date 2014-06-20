@@ -1,4 +1,4 @@
-/*  system.pl,v 1.1.1.1 1992/05/26 11:51:38 jan Exp
+/*  $Id: system.pl,v 1.3 1994/11/22 15:10:28 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -6,7 +6,7 @@
     Purpose: Manipulate system predicates and system mode
 */
 
-:- module(system,
+:- module(swi_system_utilities,
 	[ lock_predicate/2
 	, unlock_predicate/2
 	, system_mode/1
@@ -46,7 +46,7 @@ system_module :-
 lock_predicate(Spec, Arity) :-
 	$strip_module(Spec, Module, Name),
 	functor(Head, Name, Arity ),
-	$predicate_attribute(Module:Head, system, 1).
+	$set_predicate_attribute(Module:Head, system, 1).
 
 %	unlock_predicate(+Name, Arity)
 %	Transform a system predicate into a normal system predicate.
@@ -54,4 +54,4 @@ lock_predicate(Spec, Arity) :-
 unlock_predicate(Spec, Arity) :-
 	$strip_module(Spec, Module, Name),
 	functor(Head, Name, Arity ),
-	$predicate_attribute(Module:Head, system, 0).
+	$set_predicate_attribute(Module:Head, system, 0).

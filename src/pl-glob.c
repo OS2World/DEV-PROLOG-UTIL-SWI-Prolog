@@ -1,10 +1,13 @@
-/*  pl-glob.c,v 1.4 1993/02/23 13:16:33 jan Exp
+/*  $Id: pl-glob.c,v 1.30 2001/05/20 20:56:59 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: File Name Expansion
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #if __TOS__
@@ -14,23 +17,45 @@
 #endif
 
 #include "pl-incl.h"
+#include "pl-ctype.h"
 
-#if unix || EMX
-#include <sys/param.h>
-#include <sys/stat.h>
-#ifdef DIR_INCLUDE
-#include DIR_INCLUDE
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
+
+#ifdef __WATCOMC__
+#include <direct.h>
+#else /*__WATCOMC__*/
+#if HAVE_DIRENT_H
+# include <dirent.h>
 #else
-#include <dirent.h>
+# define dirent direct
+# if HAVE_SYS_NDIR_H
+#  include <sys/ndir.h>
+# endif
+# if HAVE_SYS_DIR_H
+#  include <sys/dir.h>
+# endif
+# if HAVE_NDIR_H
+#  include <ndir.h>
+# endif
 #endif
-#ifdef DIR_INCLUDE2
-#include DIR_INCLUDE2
+#endif /*__WATCOMC__*/
+
+#ifdef HAVE_SYS_STAT_H
+#include <sys/stat.h>
 #endif
+#ifdef HAVE_SYS_PARAM_H
+#include <sys/param.h>
+#endif
+
+#define O_EXPANDS_TESTS_EXISTS 1
+
 #ifndef IS_DIR_SEPARATOR
 #define IS_DIR_SEPARATOR(c)	((c) == '/')
 #endif
-#endif
 
+#define char_to_int(c)	(0xff & (int)(c))
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Unix Wildcard Matching.  Recognised:
@@ -54,10 +79,7 @@ intermediate representation:
   ANYOF		Next 16 bytes are bitmap
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-#define MAXEXPAND	1024
-#define NextIndex(i)	((i) < MAXEXPAND-1 ? (i)+1 : 0)
-
-#define MAXCODE 512
+#define MAXCODE 1024
 
 #define ANY	128
 #define STAR	129
@@ -69,31 +91,15 @@ intermediate representation:
 #define NOCURL	0
 #define CURL	1
 
-#if !O_UCHAR_PREDEFINED
-typedef unsigned char uchar;
-#endif
+typedef unsigned char matchcode;
 
-struct bag
-{ int	 in;			/* in index */
-  int	 out;			/* out index */
-  int	 size;			/* number of entries */
-  bool	 changed;		/* did bag change? */
-  bool	 expanded;		/* Expanded bag? */
-  char	*bag[MAXEXPAND];	/* bag of paths */
-};
+typedef struct
+{ int		size;
+  matchcode	code[MAXCODE];
+} compiled_pattern;
 
-static struct out
-{ int	size;
-  uchar	code[MAXCODE];
-} cbuf;
-
-forwards char	*compile_pattern P((struct out *, char *, int));
-forwards bool	match_pattern P((uchar *, char *));
-forwards int	stringCompare P((char**, char**));
-forwards bool	expand P((char *, char **, int *));
-forwards bool	Exists P((char *));
-forwards char	*change_string P((char *, char *));
-forwards bool	expandBag P((struct bag *));
+static char	*compile_pattern(compiled_pattern *, char *, int);
+static bool	match_pattern(matchcode *, char *);
 
 #define Output(c)	{ if ( Out->size > MAXCODE-1 ) \
 			  { warning("pattern too large"); \
@@ -101,13 +107,20 @@ forwards bool	expandBag P((struct bag *));
 			  } \
 			  Out->code[Out->size++] = c; \
 			}
-#define setMap(c)	{ map[(c)/8] |= 1 << ((c) % 8); }
 
-bool
-compilePattern(p)
-char *p;
-{ cbuf.size = 0;
-  if ( compile_pattern(&cbuf, p, NOCURL) == (char *) NULL )
+static inline void
+setMap(matchcode *map, int c)
+{ if ( !trueFeature(FILE_CASE_FEATURE) )
+    c = makeLower(c);
+
+  map[(c)/8] |= 1 << ((c) % 8);
+}
+
+
+static bool
+compilePattern(char *p, compiled_pattern *cbuf)
+{ cbuf->size = 0;
+  if ( compile_pattern(cbuf, p, NOCURL) == (char *) NULL )
     fail;
 
   succeed;
@@ -115,14 +128,11 @@ char *p;
 
 
 static char *
-compile_pattern(Out, p, curl)
-struct out *Out;
-char *p;
-int curl;
-{ char c;
+compile_pattern(compiled_pattern *Out, char *p, int curl)
+{ int c;
 
   for(;;)
-  { switch(c = *p++)
+  { switch(c = char_to_int(*p++))
     { case EOS:
 	break;
       case '\\':
@@ -138,7 +148,7 @@ int curl;
 	Output(STAR);
 	continue;
       case '[':
-	{ uchar *map;
+	{ matchcode *map;
 	  int n;
 
 	  Output(ANYOF);
@@ -159,20 +169,20 @@ int curl;
 		{ warning("Unmatched '['");
 		  return (char *)NULL;
 		}
-		setMap(*p);
+		setMap(map, *p);
 		p++;
 		continue;
 	      case ']':
 		break;
 	      default:
 		if ( p[-1] != ']' && p[0] == '-' && p[1] != ']' )
-		{ register int chr;
+		{ int chr;
 
 		  for ( chr=p[-1]; chr <= p[1]; chr++ )
-		    setMap(chr);
+		    setMap(map, chr);
 		  p += 2;
 		} else
-		  setMap(c);
+		  setMap(map, c);
 		continue;
 	    }
 	    break;
@@ -205,6 +215,15 @@ int curl;
 	  
 	  continue;
 	}
+      case ANY:
+      case STAR:
+      case ALT:
+      case JMP:
+      case ANYOF:
+      case EXIT:
+	PL_error(NULL, 0, "Reserved character",
+		 ERR_REPRESENTATION, ATOM_pattern);
+	return NULL;
       case '}':
       case ',':
 	if ( curl == CURL )
@@ -213,7 +232,9 @@ int curl;
 	}
 	/*FALLTHROUGH*/
       default:
-	Output(c & 0x7f);
+        if ( !trueFeature(FILE_CASE_FEATURE) )
+	  c = makeLower(c);
+	Output(c);
 	continue;
     }
 
@@ -223,17 +244,16 @@ int curl;
 }
 
 
-bool
-matchPattern(s)
-char *s;
-{ return match_pattern(cbuf.code, s);
+static inline bool
+matchPattern(char *s, compiled_pattern *cbuf)
+{ return match_pattern(cbuf->code, s);
 }
 
+
 static bool
-match_pattern(p, s)
-register uchar *p;
-register char *s;
-{ register uchar c;
+match_pattern(matchcode *p, char *str)
+{ matchcode c;
+  matchcode *s = (matchcode *) str;
 
   for(;;)
   { switch( c = *p++ )
@@ -245,15 +265,21 @@ register char *s;
 	  s++;
 	  continue;
       case ANYOF:					/* [...] */
-	  if ( p[*s / 8] & (1 << (*s % 8)) )
+        { matchcode c2 = *s;
+
+	  if ( !trueFeature(FILE_CASE_FEATURE) )
+	    c2 = makeLower(c2);
+
+	  if ( p[c2 / 8] & (1 << (c2 % 8)) )
 	  { p += 16;
 	    s++;
 	    continue;
 	  }
 	  fail;
+	}
       case STAR:					/* * */
 	  do
-	  { if ( match_pattern(p, s) )
+	  { if ( match_pattern(p, (char *)s) )
 	      succeed;
 	  } while( *s++ );
 	  fail;
@@ -261,189 +287,180 @@ register char *s;
 	  p += *p;
 	  continue;
       case ALT:
-	  if ( match_pattern(p+1, s) )
+	  if ( match_pattern(p+1, (char *)s) )
 	    succeed;
 	  p += *p;
 	  continue;	  
       default:						/* character */
-	  if ( c != (uchar) *s )
-	    fail;
-	  s++;
-	  continue;
+	  if ( c == *s ||
+	       (!trueFeature(FILE_CASE_FEATURE) && c == makeLower(*s)) )
+	  { s++;
+	    continue;
+	  }
+          fail;
     }
   }
 }
 
 
 word
-pl_wildcard_match(pattern, string)
-Word pattern, string;
+pl_wildcard_match(term_t pattern, term_t string)
 { char *p, *s;
+  compiled_pattern buf;
 
-  initAllocLocal();
-  p = primitiveToString(*pattern, TRUE);
-  s = primitiveToString(*string, TRUE);
-  stopAllocLocal();
-
-  if ( p == (char *)NULL || s == (char *)NULL )
-    return warning("wildcard_match/2: instantiation fault");
-
-  TRY( compilePattern(p) );
-
-  return matchPattern(s);
-}
-
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-File Name Expansion.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-word
-pl_expand_file_name(f, l)
-Word f, l;
-{ char spec[MAXPATHLEN];
-  char *s = primitiveToString(*f, FALSE);
-  char *vector[MAXEXPAND];
-  char **v;
-  int filled;
-
-  if ( s == (char *) NULL )
-    return warning("expand_file_name/2: instantiation fault");
-  if ( strlen(s) > MAXPATHLEN-1 )
-    return warning("expand_file_name/2: name too long");
-  TRY( expandVars(s, spec) );
-
-  TRY( expand(spec, vector, &filled) );
-
-  for( v = vector; filled > 0; filled--, v++ )
-  { word w;
-
-    w = (word) lookupAtom(*v);
-    APPENDLIST(l, &w);
-  }
-
-  CLOSELIST(l);
-
-  succeed;
-}
-
-static int
-stringCompare(s1, s2)
-register char **s1, **s2;
-{ return strcmp(*s1, *s2);
-}
-
-static bool
-expand(f, argv, argc)
-char *f;
-char **argv;
-int *argc;
-{ struct bag b;
-
-  b.changed = b.expanded = FALSE;
-  b.out = 0;			/* put the first entry in the bag */
-  b.in = b.size = 1;
-  b.bag[0] = store_string(f);
-#if tos				/* case insensitive: do all lower case */
-  strlwr(b.bag[0]);
-#endif
-/* Note for OS2: HPFS is case insensitive but case preserving. */
-
-  do				/* expand till nothing to expand */
-  { b.changed = FALSE;  
-    TRY( expandBag(&b) );
-  } while( b.changed );
-
-  { char **r = argv;
-
-    *argc = b.size;
-    for( ; b.out != b.in; b.out = NextIndex(b.out) )
-      *r++ = change_string(b.bag[b.out], PrologPath(b.bag[b.out]));
-    *r = (char *) NULL;
-    qsort(argv, b.size, sizeof(char *), stringCompare);
-
-    succeed;
-  }
-}
-
-#if unix || EMX
-static bool
-Exists(path)
-char *path;
-{ struct stat buf;
-  extern int stat();
-
-  if ( stat(OsPath(path), &buf) == -1 )
+  if ( !PL_get_chars_ex(pattern, &p, CVT_ALL) ||
+       !PL_get_chars_ex(string,  &s, CVT_ALL) )
     fail;
 
-  succeed;
-}
-#endif
-
-#if tos
-static bool
-Exists(path)
-char *path;
-{ struct ffblk buf;
-
-  DEBUG(2, printf("Checking existence of %s ... ", path));
-  if ( findfirst(OsPath(path), &buf, SUBDIR|HIDDEN) == 0 )
-  { DEBUG(2, printf("yes\n"));
-    succeed;
+  if ( compilePattern(p, &buf) )
+  { return matchPattern(s, &buf);
   }
-  DEBUG(2, printf("no\n"));
 
-  fail;
-}
-#endif
-
-static char *
-change_string(old, new)
-char *old, *new;
-{ return store_string(new);
+  return PL_error(NULL, 0, NULL, ERR_TYPE, ATOM_pattern, pattern);
 }
 
-static bool
-expandBag(b)
-struct bag *b;
-{ int high = b->in;
 
-  for( ; b->out != high; b->out = NextIndex(b->out) )
-  { char *head = b->bag[b->out];
-    char *tail;
-    register char *s = head;
-    
+		 /*******************************
+		 *	EXPAND_FILE_NAME/2	*
+		 *******************************/
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Wildcart expansion of a pattern to a list   of files. This code uses two
+`buffers'  for  storing  the   intermediate    results   while  limiting
+fragmentation. The `strings' buffer contains  all strings generated. The
+files contains indices in the `strings' buffer  pointing to the start of
+strings.  The indices in the range [start,end) are valid.
+
+First  this  set  is   filled   with    the   empty   string.  Next  the
+directory-segment with the first wildcart is   located.  If found, we go
+through the current set, adding the segments without wildcarts, applying
+the wildcart on the directory and adding   everything  found to the set.
+The old set is deleted by incrementing info.start.
+
+If we are at the end, we add the remaining non-wildcart segments to each
+element of the set, deleting it if the result does not exits.
+
+Finally we sort the result.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+typedef struct
+{ tmp_buffer	files;			/* our files */
+  tmp_buffer	strings;		/* our strings */
+  int		start;			/* 1-st valid entry of files */
+  int		end;			/* last valid entry of files */
+} glob_info, *GlobInfo;
+
+#define isspecial(c) \
+	((c) == '[' || (c) == '{' || (c) == '?' || (c) == '*')
+
+static void
+free_expand_info(GlobInfo info)
+{ discardBuffer(&info->files);
+  discardBuffer(&info->strings);
+}
+
+
+static void
+add_path(const char *path, GlobInfo info)
+{ int idx = entriesBuffer(&info->strings, char);
+  int n = strlen(path)+1;
+
+  addMultipleBuffer(&info->strings, path, n, char);
+  addBuffer(&info->files, idx, int);
+  info->end++;
+}
+
+
+const char *
+expand_str(GlobInfo info, int at)
+{ char *s = &fetchBuffer(&info->strings, at, char);
+
+  return (const char *)s;
+}
+
+
+const char *
+expand_entry(GlobInfo info, int idx)
+{ int at = fetchBuffer(&info->files, idx, int);
+
+  return expand_str(info, at);
+}
+
+
+static void
+un_escape(char *to, const char *from, const char *end)
+{ while( from < end )
+  { if ( *from == '\\' && (isspecial(from[1]) || from[1] == '\\') )
+      from++;
+    *to++ = *from++;
+  }
+  *to = EOS;
+}
+
+
+static int
+expand(const char *pattern, GlobInfo info)
+{ const char *pat = pattern;
+  compiled_pattern cbuf;
+  char prefix[MAXPATHLEN];		/* before first pattern */
+  char patbuf[MAXPATHLEN];		/* pattern buffer */
+  int end, dot;
+
+  initBuffer(&info->files);
+  initBuffer(&info->strings);
+  info->start = 0;
+  info->end = 0;
+
+  add_path("", info);
+
+  for(;;)
+  { const char *s = pat, *head = pat, *tail;
+
     for(;;)
-    { switch( *s++ )
-      { case EOS:				/* no special characters */
-	  if ( b->expanded == FALSE || Exists(b->bag[b->out]) )
-	  { b->bag[b->in] = b->bag[b->out];
-	    b->in = NextIndex(b->in);
-	  } else
-	  { b->size--;
+    { int c;
+  
+      switch( (c=*s++) )
+      { case EOS:
+	  if ( s > pat )		/* something left and expanded */
+	  { un_escape(prefix, pat, s);
+	  
+	    end = info->end;
+	    for( ; info->start < end; info->start++ )
+	    { char path[MAXPATHLEN];
+	      int plen;
+  
+	      strcpy(path, expand_entry(info, info->start));
+	      plen = strlen(path);
+	      if ( prefix[0] && plen > 0 && path[plen-1] != '/' )
+		path[plen++] = '/';
+	      strcpy(&path[plen], prefix);
+	      if ( end == 1 || ExistsFile(path) )
+		add_path(path, info);
+	    }
 	  }
-	  goto next_bag;
-#if tos || OS2
-	case '\\':
-#endif
-	case '/':				/* no specials sofar */
-	  head = s;
-	  continue;
+	  succeed;
 	case '[':				/* meta characters: expand */
 	case '{':
 	case '?':
 	case '*':
 	  break;
+	case '\\':
+	  if ( isspecial(*s) )
+	  { s++;
+	    continue;
+	  }
+	/*FALLTHROUGH*/
 	default:
+	  if ( IS_DIR_SEPARATOR(c) )
+	    head = s;
 	  continue;
       }
       break;
     }
-
-    b->expanded = b->changed = TRUE;
-    b->size--;
+    
     for( tail=s; *tail && !IS_DIR_SEPARATOR(*tail); tail++ )
       ;
-
+  
 /*  By now, head points to the start of the path holding meta characters,
     while tail points to the tail:
 
@@ -451,88 +468,121 @@ struct bag *b;
 	 ^        ^
        head     tail
 */
+    un_escape(prefix, pat, head);
+    un_escape(patbuf, head, tail);
+  
+    if ( !compilePattern(patbuf, &cbuf) )		/* syntax error */
+      fail;
+    dot = (patbuf[0] == '.');			/* do dots as well */
+  
+    end = info->end;
+  
+    for(; info->start < end; info->start++)
+    { DIR *d;
+      struct dirent *e;
+      char path[MAXPATHLEN];
+      char tmp[MAXPATHLEN];
+      const char *current = expand_entry(info, info->start);
 
-    { char prefix[MAXPATHLEN];
-      char expanded[MAXPATHLEN];
-      char *path;
-      char *s, *q;
-      int dot;
+      strcpy(path, current);
+      strcat(path, prefix);
+      
+      if ( (d=opendir(path[0] ? OsPath(path, tmp) : ".")) )
+      { int plen = strlen(path);
 
-      for( q=prefix, s=b->bag[b->out]; s < head; )
-	*q++ = *s++;
-      *q = EOS;
-      path = (prefix[0] == EOS ? "." : prefix);
+	if ( plen > 0 && path[plen-1] != '/' )
+	  path[plen++] = '/';
 
-      for( q=expanded, s=head; s < tail; )
-        *q++ = *s++;
-      *q = EOS;
-
-      if ( compilePattern(expanded) == FALSE )		/* syntax error */
-        fail;
-      dot = (expanded[0] == '.');			/* do dots as well */
-
-#if unix || EMX
-      { DIR *d;
-#if O_STRUCT_DIRECT
-	struct direct *e;
-	extern struct direct *readdir();
-#else
-	struct dirent *e;
-	extern struct dirent *readdir();
+	for(e=readdir(d); e; e = readdir(d))
+	{
+#ifdef __MSDOS__
+	  strlwr(e->d_name);
 #endif
-	extern DIR *opendir();
-
-	if ( (d = opendir(OsPath(path))) != (DIR *)NULL )
-	{ for(e=readdir(d); e; e = readdir(d))
-	  { if ( (dot || e->d_name[0] != '.') && matchPattern(e->d_name) )
-	    { strcpy(expanded, prefix);
-	      strcat(expanded, e->d_name);
-	      strcat(expanded, tail);
-
-	      b->bag[b->in] = change_string(b->bag[b->out], expanded);
-	      b->in = NextIndex(b->in);
-	      b->size++;
-	      if ( b->in == b->out )
-		return warning("Too many matches");
-	    }
-	  }
-	  closedir(d);
-	}
-      }
-#endif
-
-#if tos
-      { char dpat[MAXPATHLEN];
-	struct ffblk buf;
-	int r;
-
-	strcpy(dpat, path);
-	strcat(dpat, "\\*.*");
-
-	DEBUG(2, printf("match path = %s\n", dpat));
-	for(r=findfirst(OsPath(dpat), &buf, SUBDIR|HIDDEN); r == 0; r=findnext(&buf))
-	{ char *name = buf.ff_name;
-	  strlwr(name);		/* match at lower case */
-
-	  DEBUG(2, printf("found %s\n", name));
-	  if ( (dot || name[0] != '.') && matchPattern(name) )
-	  { strcpy(expanded, prefix);
-	    strcat(expanded, name);
-	    strcat(expanded, tail);
-
-	    DEBUG(2, printf("%s matches pattern\n", name));
-	    b->bag[b->in] = change_string(b->bag[b->out], expanded);
-	    b->in = NextIndex(b->in);
-	    b->size++;
-	    if ( b->in == b->out )
-	      return warning("Too many matches");
+	  if ( (dot || e->d_name[0] != '.') &&
+	       matchPattern(e->d_name, &cbuf) )
+	  { char newp[MAXPATHLEN];
+  
+	    strcpy(newp, path);
+	    strcpy(&newp[plen], e->d_name);
+/*	    if ( !tail[0] || ExistsDirectory(newp) )
+	    Saves memory, but involves one more file-access
+*/
+	      add_path(newp, info);
 	  }
 	}
+	closedir(d);
       }
-#endif /* tos */
     }
-  next_bag:;
+
+    pat = tail;
+    if ( IS_DIR_SEPARATOR(*pat) )
+      pat++;
+  }
+}
+
+
+static int
+compareBagEntries(const void *a1, const void *a2)
+{ GlobInfo info = LD->glob_info;
+  int i1 = *(int *)a1;
+  int i2 = *(int *)a2;
+  const char *s1, *s2;
+
+  s1 = expand_str(info, i1);
+  s2 = expand_str(info, i2);
+  
+  if ( trueFeature(FILE_CASE_FEATURE) )
+    return strcmp(s1, s2);
+  else
+    return stricmp(s1, s2);
+}
+
+
+static void
+sort_expand(GlobInfo info)
+{ int *ip = &fetchBuffer(&info->files, info->start, int);
+  int is = info->end - info->start;
+  
+  LD->glob_info = info;
+  qsort(ip, is, sizeof(int), compareBagEntries);
+}
+
+
+word
+pl_expand_file_name(term_t f, term_t list)
+{ char spec[MAXPATHLEN];
+  char *s;
+  glob_info info;
+  term_t l    = PL_copy_term_ref(list);
+  term_t head = PL_new_term_ref();
+  int i;
+
+  if ( !PL_get_chars_ex(f, &s, CVT_ALL) )
+    fail;
+  if ( strlen(s) > MAXPATHLEN-1 )
+    return PL_error(NULL, 0, "File name too long",
+		    ERR_DOMAIN, ATOM_pattern, f);
+
+  if ( !expandVars(s, spec) )
+    fail;
+  if ( !expand(spec, &info) )
+    goto failout;
+  sort_expand(&info);
+
+  for( i = info.start; i< info.end; i++ )
+  { const char *e = expand_entry(&info, i);
+
+    if ( !PL_unify_list(l, head, l) ||
+	 !PL_unify_atom_chars(head, e) )
+      goto failout;
   }
 
+  if ( !PL_unify_nil(l) )
+  { failout:
+    free_expand_info(&info);
+    fail;
+  }
+
+  free_expand_info(&info);
   succeed;
 }

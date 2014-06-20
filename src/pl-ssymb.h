@@ -1,10 +1,13 @@
-/*  pl-ssymb.h,v 1.1.1.1 1992/05/26 11:52:27 jan Exp
+/*  $Id: pl-ssymb.h,v 1.11 2000/04/07 09:30:56 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Redefine functions fr compilers only handling short symbols
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #define pl_dwim_match		Sdwimmatch
@@ -30,7 +33,6 @@
 #define pl_collect_parms	Scollparms
 #define pl_current_arithmetic_function Scfa
 #define pl_current_atom		Sca
-#define pl_current_stream	Scs
 #define pl_current_input	Scin
 #define pl_current_output	Scout
 #define pl_current_functor	Scfunctor
@@ -46,9 +48,6 @@
 #define pl_prolog_current_frame	Spcf
 #define pl_prolog_frame_attribute	Spfa
 #define pl_trace		Strace
-#define pl_trace_continuation	Stracecont
-#define pl_flush		Sflush
-#define pl_flush_output		Sflushout
 #define pl_format		Sfmt
 #define pl_format3		Sfmt3
 #define pl_format_number	Sfmtnumber
@@ -57,9 +56,6 @@
 #define	pl_writeq		Swrtq
 #define	pl_write2		Swrt2
 #define	pl_writeq2		Swrtq2
-#define	pl_write_on_string	Swrtos
-#define	pl_write_on_atom	Swrtoa
-#define	pl_write_on_list	Swrtol
 #define pl_string		Sstr
 #define pl_string_length	Sstrl
 #define pl_string_to_atom	Sstrta
@@ -109,8 +105,6 @@
 #define pl_recorda		Sreca
 #define pl_recordz		Srecz
 #define pl_recorded		Sreced
-#define pl_read_variables	Srdvars
-#define pl_read_variables3	Srdvars3
 #define pl_read			Sread
 #define pl_read_clause		Srdcl
 #define pl_read_clause2		Srdcl2
@@ -128,4 +122,3 @@
 #define pl_tty_goto		Sttygoto
 
 #define PROCEDURE_garbage_collect0	Sproc_gc
-#define PROCEDURE_alt1			Sproc_alt

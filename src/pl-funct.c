@@ -1,210 +1,267 @@
-/*  pl-funct.c,v 1.1.1.1 1992/05/26 11:52:19 jan Exp
+/*  $Id: pl-funct.c,v 1.28 2000/10/24 10:19:20 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Functor (re) allocation
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
+/*#define O_DEBUG 1*/
 #include "pl-incl.h"
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Functor (name/arity) handling.  A functor is a unique object (like atoms).
+See pl-atom.c for many useful comments on the representation.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-static FunctorDef functorDefTable[FUNCTORHASHSIZE];
+#define LOCK()   PL_LOCK(L_FUNCTOR)
+#define UNLOCK() PL_UNLOCK(L_FUNCTOR)
 
-FunctorDef
-lookupFunctorDef(atom, arity)
-register Atom atom;
-register int arity;
-{ int v = pointerHashValue(atom, FUNCTORHASHSIZE);
-  register FunctorDef f;
+#define functor_buckets (GD->functors.buckets)
+#define functorDefTable (GD->functors.table)
 
-  DEBUG(9, printf("Lookup functor %s/%d = ", stringAtom(atom), arity));
-  for(f = functorDefTable[v]; f && !isRef((word)f); f = f->next)
+static void	  allocFunctorTable();
+static void	  rehashFunctors();
+
+#define maxFunctorIndex() entriesBuffer(&functor_array, FunctorDef)
+#define getFunctorByIndex(i) baseBuffer(&functor_array, FunctorDef)[(i)]
+
+
+static void
+registerFunctor(FunctorDef fd)
+{ int n = maxFunctorIndex();
+  int amask = (fd->arity < F_ARITY_MASK ? fd->arity : F_ARITY_MASK);
+    
+  fd->functor = MK_FUNCTOR(n, amask);
+  addBuffer(&functor_array, fd, FunctorDef);
+
+  DEBUG(0, assert(fd->arity == arityFunctor(fd->functor)));
+}
+
+
+functor_t
+lookupFunctorDef(atom_t atom, int arity)
+{ int v;
+  FunctorDef f;
+
+  LOCK();
+  v = pointerHashValue(atom, functor_buckets);
+
+  DEBUG(9, Sdprintf("Lookup functor %s/%d = ", stringAtom(atom), arity));
+  for(f = functorDefTable[v]; f; f = f->next)
   { if (atom == f->name && f->arity == arity)
-    { DEBUG(9, printf("%D (old)\n", f));
-      return f;
+    { DEBUG(9, Sdprintf("%p (old)\n", f));
+      UNLOCK();
+      return f->functor;
     }
   }
   f = (FunctorDef) allocHeap(sizeof(struct functorDef));
-  f->next = functorDefTable[v];
-  f->type = FUNCTOR_TYPE;
-  f->name = atom;
-  f->arity = arity;
+  f->functor = 0L;
+  f->name    = atom;
+  f->arity   = arity;
+  f->flags   = 0;
+  f->next    = functorDefTable[v];
   functorDefTable[v] = f;
-  statistics.functors++;
+  registerFunctor(f);
+  GD->statistics.functors++;
+  PL_register_atom(atom);
 
-  DEBUG(9, printf("%D (new)\n", f));
+  DEBUG(9, Sdprintf("%p (new)\n", f));
 
-  return f;
+  if ( functor_buckets * 2 < GD->statistics.functors )
+    rehashFunctors();
+
+  UNLOCK();
+
+  return f->functor;
 }
 
 
-int
-atomIsFunctor(atom)
-Atom atom;
-{ int v = pointerHashValue(atom, FUNCTORHASHSIZE);
+static void
+rehashFunctors()
+{ FunctorDef *oldtab = functorDefTable;
+  int oldbucks       = functor_buckets;
+  int i, mx = maxFunctorIndex();
+
+  startCritical;
+  functor_buckets *= 2;
+  allocFunctorTable();
+
+  DEBUG(0, Sdprintf("Rehashing functor-table to %d entries\n",
+		    functor_buckets));
+
+  for(i = 0; i<mx; i++)
+  { FunctorDef f = getFunctorByIndex(i);
+    int v = pointerHashValue(f->name, functor_buckets);
+
+    f->next = functorDefTable[v];
+    functorDefTable[v] = f;
+  }
+
+  freeHeap(oldtab, oldbucks * sizeof(FunctorDef));
+  endCritical;
+}
+
+
+
+functor_t
+isCurrentFunctor(atom_t atom, int arity)
+{ int v;
   FunctorDef f;
 
-  for(f = functorDefTable[v]; f && !isRef((word)f); f = f->next)
-  { if ( atom == f->name )
-      return f->arity;
-  }
-
-  return -1;
-}
-
-
-FunctorDef
-isCurrentFunctor(atom, arity)
-Atom atom;
-int arity;
-{ int v = pointerHashValue(atom, FUNCTORHASHSIZE);
-  FunctorDef f;
-
-  for(f = functorDefTable[v]; f && !isRef((word)f); f = f->next)
-  { if (atom == f->name && f->arity == arity)
-      return f;
-  }
-
-  return (FunctorDef) NULL;
-}
-
-
-bool
-atomIsProcedureModule(atom, m)
-Atom atom;
-Module m;
-{ int v = pointerHashValue(atom, FUNCTORHASHSIZE);
-  FunctorDef f;
-  Procedure proc;
-
-  for(f = functorDefTable[v]; f && !isRef((word)f); f = f->next)
-  { if ( atom == f->name &&
-	 (proc = isCurrentProcedure(f, m)) != (Procedure)NULL &&
-	 isDefinedProcedure(proc) )
-      succeed;
-  }
-
-  fail;
-}
-
-
-bool
-atomIsProcedure(atom)
-Atom atom;
-{ Symbol s;
-
-  for_table(s, moduleTable)
-    if ( atomIsProcedureModule(atom, (Module)s->value) )         
-      succeed;
-
-  fail;
-}
-
-
-struct functorDef functors[] = {
-#include "pl-funct.ic"
-{ (FunctorDef)NULL,	FUNCTOR_TYPE,	(Atom) NULL, 0 }
-};
-
-void
-initFunctors()
-{ register int n;
-
-  { register FunctorDef *f;
-    for(n=0, f=functorDefTable; n < (FUNCTORHASHSIZE-1); n++, f++)
-      *f = (FunctorDef)makeRef(f+1);
-    *f = (FunctorDef) NULL;
-  }
-
-  { register FunctorDef f;
-    register int v;
-
-    for( f = &functors[0]; f->name; f++ )
-    { v = pointerHashValue(f->name, FUNCTORHASHSIZE);
-      f->next = functorDefTable[v];
-      functorDefTable[v] = f;
-      statistics.functors++;
+  LOCK();
+  v = pointerHashValue(atom, functor_buckets);
+  for(f = functorDefTable[v]; f; f = f->next)
+  { if ( atom == f->name && f->arity == arity )
+    { UNLOCK();
+      return f->functor;
     }
   }
+  UNLOCK();
+
+  return 0;
 }
+
+typedef struct
+{ atom_t name;
+  char   arity;
+} builtin_functor;
+
+#define FUNCTOR(n, a) { n, a }
+static const builtin_functor functors[] = {
+#include "pl-funct.ic"
+FUNCTOR(NULL_ATOM, 0)
+};
+#undef FUNCTOR
+
+
+static void
+allocFunctorTable()
+{ int size = functor_buckets * sizeof(FunctorDef);
+
+  functorDefTable = allocHeap(size);
+  memset(functorDefTable, 0, size);
+}
+
+
+static void
+registerBuiltinFunctors()
+{ int size = sizeof(functors)/sizeof(builtin_functor) - 1;
+  FunctorDef f = allocHeap(size * sizeof(struct functorDef));
+  const builtin_functor *d;
+
+  GD->statistics.functors = size;
+
+  for(d = functors; d->name; d++, f++)
+  { int v = pointerHashValue(d->name, functor_buckets);
+
+    f->name             = d->name;
+    f->arity            = d->arity;
+    f->next             = functorDefTable[v];
+    f->flags		= 0;
+    functorDefTable[v]  = f;
+    registerFunctor(f);
+  }
+}
+
+
+void
+initFunctors(void)
+{ LOCK();
+  if ( !functorDefTable )
+  { initAtoms();
+    functor_buckets = FUNCTORHASHSIZE;
+    initBuffer(&functor_array);
+    allocFunctorTable();
+    registerBuiltinFunctors();
+  }
+  UNLOCK();
+}
+
+
+void
+cleanupFunctors(void)
+{ discardBuffer(&functor_array);
+}
+
 
 #if TEST
 checkFunctors()
 { register FunctorDef f;
   int n;
 
-  for( n=0; n < FUNCTORHASHSIZE; n++ )
+  for( n=0; n < functor_buckets; n++ )
   { f = functorDefTable[n];
-    for( ;f && !isRef((word)f); f = f->next )
-    { if ( f->type != FUNCTOR_TYPE )
-        printf("[ERROR: Functor %D has bad type: %D]\n", f, f->type);
-      if ( f->arity < 0 || f->arity > 10 )	/* debugging only ! */
-        printf("[ERROR: Functor %D has dubious arity: %d]\n", f, f->arity);
-      if ( !inCore(f->name) || f->name->type != ATOM_TYPE )
-        printf("[ERROR: Functor %D has illegal name: %D]\n", f, f->name);
+    for( ;f ; f = f->next )
+    { if ( f->arity < 0 || f->arity > 10 )	/* debugging only ! */
+        Sdprintf("[ERROR: Functor %ld has dubious arity: %d]\n", f, f->arity);
+      if ( !isArom(f->name) )
+        Sdprintf("[ERROR: Functor %ld has illegal name: %ld]\n", f, f->name);
       if ( !( f->next == (FunctorDef) NULL ||
-	      isRef((word)f->next) ||
 	      inCore(f->next)) )
-	printf("[ERROR: Functor %D has illegal next: %D]\n", f, f->next);
+	Sdprintf("[ERROR: Functor %ld has illegal next: %ld]\n", f, f->next);
     }
-    if ( (isRef((word)f) &&
-	 ((FunctorDef *) unRef((word)f) != &functorDefTable[n+1])) )
-      printf("[ERROR: Bad continuation pointer (fDef, n=%d)]\n", n);
-    if ( f == (FunctorDef) NULL && n != (FUNCTORHASHSIZE-1) )
-      printf("[ERROR: illegal end pointer (fDef, n=%d)]\n", n);
   }
 }
 #endif
 
 word
-pl_current_functor(name, arity, h)
-Word name, arity;
-word h;
-{ FunctorDef fdef;
+pl_current_functor(term_t name, term_t arity, word h)
+{ atom_t nm = 0;
+  int  ar;
+  mark m;
+  int mx, i;
 
   switch( ForeignControl(h) )
   { case FRG_FIRST_CALL:
-      if ( (!isAtom(*name) && !isVar(*name))
-	|| (!isInteger(*arity) && !isVar(*arity)))
-	return warning("current_functor/2: instantiation fault");
+      if ( PL_get_atom(name, &nm) &&
+	   PL_get_integer(arity, &ar) )
+	return isCurrentFunctor(nm, ar) ? TRUE : FALSE;
 
-      if (isInteger(*arity) && isAtom(*name))
-	if (isCurrentFunctor((Atom)*name, (int)valNum(*arity)) != (FunctorDef) NULL)
-	  succeed;
-	else
-	  fail;
+      if ( !(PL_is_integer(arity) || PL_is_variable(arity)) )
+	return PL_error("current_functor", 2, NULL, ERR_DOMAIN,
+			ATOM_integer, arity);
 
-      fdef = functorDefTable[0];
+      if ( !PL_is_variable(name) )
+	return PL_error("current_functor", 2, NULL, ERR_DOMAIN,
+			ATOM_atom, name);
+      i = 0;
       break;
     case FRG_REDO:
-      fdef = (FunctorDef) ForeignContextAddress(h);
+      PL_get_atom(name, &nm);
+      i = ForeignContextInt(h);
       break;
     case FRG_CUTTED:
     default:
       succeed;
   }
+  DEBUG(9, Sdprintf("current_functor(): i = %d\n", i));
 
-  DEBUG(9, printf("current_functor(): fdef = %D\n", fdef));
-  for(; fdef; fdef = fdef->next)
-  { while( isRef((word)fdef) )
-    { fdef = *((FunctorDef *)unRef(fdef));
-      if (fdef == (FunctorDef) NULL)
-	fail;
+  LOCK();
+  mx = maxFunctorIndex();
+  Mark(m);
+  for(; i<mx; i++)
+  { FunctorDef fdef = getFunctorByIndex(i);
+
+    if ( fdef->arity == 0 ||
+         (nm && nm != fdef->name) )
+      continue;
+    if ( !PL_unify_atom(name, fdef->name) ||
+	 !PL_unify_integer(arity, fdef->arity) )
+    { Undo(m);
+
+      continue;
     }
-    if (arity == 0)
-      continue;
-    if ( unifyAtomic(name, fdef->name) == FALSE ||
-	 unifyAtomic(arity, consNum(fdef->arity)) == FALSE)
-      continue;
-    DEBUG(9, printf("Returning backtrack point %D\n", fdef->next));
+    DEBUG(9, Sdprintf("Returning backtrack point %ld\n", fdef->next));
 
-    return_next_table(FunctorDef, fdef);
+    UNLOCK();
+    ForeignRedoInt(i+1);
   }
 
+  UNLOCK();
   fail;
 }

@@ -1,13 +1,20 @@
-/*  pl-pro.c,v 1.3 1993/02/23 13:16:41 jan Exp
+/*  $Id: pl-pro.c,v 1.60 2001/03/23 14:46:41 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Support for virtual machine
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
+#ifdef SECURE_GC
+#define O_SECURE 1			/* include checkData() */
+#endif
 #include "pl-incl.h"
+
 
 		/********************************
 		*    CALLING THE INTERPRETER    *
@@ -21,110 +28,195 @@ the debugger.  Restores I/O and debugger on exit.  The Prolog  predicate
 
 word
 pl_break()
-{ word goal = (word) ATOM_break;
+{ fid_t cid = PL_open_foreign_frame();
+  term_t goal = PL_new_term_ref();
+  word rval;
 
-  return pl_break1(&goal);
+  PL_put_atom_chars(goal, "$break");
+  rval = pl_break1(goal);
+  PL_discard_foreign_frame(cid);
+
+  return rval;
 }
 
+
 word
-pl_break1(goal)
-Word goal;
-{ extern int Input, Output;
-  bool rval;
+pl_break1(term_t goal)
+{ bool rval;
 
-  int	     inSave    = Input;
-  int	     outSave   = Output;
-  long	     skipSave  = debugstatus.skiplevel;
-  bool	     traceSave = debugstatus.tracing;
-  bool	     debugSave = debugstatus.debugging;
-  int	     suspSave  = debugstatus.suspendTrace;
+  IOSTREAM *inSave  = Scurin;
+  IOSTREAM *outSave = Scurout;
+  long skipSave     = debugstatus.skiplevel;
+  int  suspSave     = debugstatus.suspendTrace;
+  int  traceSave;
+  debug_type debugSave;
 
-  Input = 0;
-  Output = 1;
+  tracemode(FALSE, &traceSave);
+  debugmode(DBG_OFF, &debugSave);
 
-  debugstatus.tracing = FALSE;
-  debugstatus.debugging = FALSE;
-  debugstatus.skiplevel = 0;
-  debugstatus.suspendTrace = 0;
+  Scurin  = Sinput;
+  Scurout = Soutput;
 
-  rval = callGoal(MODULE_user, *goal, FALSE);
+  resetTracer();
+
+  { fid_t cid = PL_open_foreign_frame();
+
+    rval = callProlog(MODULE_user, goal, PL_Q_NODEBUG, NULL);
+
+    PL_discard_foreign_frame(cid);
+  }
 
   debugstatus.suspendTrace = suspSave;
   debugstatus.skiplevel    = skipSave;
-  debugstatus.debugging    = debugSave;
-  debugstatus.tracing      = traceSave;
+  tracemode(traceSave, NULL);
+  debugmode(debugSave, NULL);
 
-  Output = outSave;
-  Input = inSave;
+  Scurout = outSave;
+  Scurin  = inSave;
 
   return rval;
 }
+
+
+word
+pl_notrace1(term_t goal)
+{ bool rval;
+
+  long	     skipSave  = debugstatus.skiplevel;
+  bool	     traceSave = debugstatus.tracing;
+
+  rval = callProlog(NULL, goal, PL_Q_NODEBUG, NULL);
+
+  debugstatus.skiplevel    = skipSave;
+  debugstatus.tracing      = traceSave;
+
+  return rval;
+}
+
+
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Call a prolog goal from C. The argument must  be  an  instantiated  term
-like for the Prolog predicate call/1.  The goal is executed in a kind of
-break environment and thus bindings which result of the call are lost.
+like for the Prolog predicate call/1.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-bool
-callGoal(module, goal, debug)
-Module module;
-word goal;
-bool debug;
-{ LocalFrame lSave   = lTop;
-  LocalFrame envSave = environment_frame;
-  mark       m;
-  Word *     aSave = aTop;
-  bool	     rval;
+int
+callProlog(Module module, term_t goal, int flags, term_t *ex)
+{ term_t g = PL_new_term_ref();
+  functor_t fd;
+  Procedure proc;
 
-  lTop = (LocalFrame)addPointer(lTop, sizeof(struct localFrame) +
-				      MAXARITY * sizeof(word));
-  lTop = (LocalFrame) addPointer(lTop, sizeof(LocalFrame));
-  verifyStack(local);
-  varFrame(lTop, -1) = (word) environment_frame;
+  PL_strip_module(goal, &module, g);
+  if ( !PL_get_functor(g, &fd) )
+    return warning("callProlog(): Illegal goal");
+  
+  proc = lookupProcedure(fd, module);
+  
+  { int arity = arityFunctor(fd);
+    term_t args = PL_new_term_refs(arity);
+    qid_t qid;
+    int n, rval;
 
-  Mark(m);
-/*  lockMark(&m); */
-  gc_status.blocked++;
-  rval = interpret(module, goal, debug);
-  gc_status.blocked--;
-  Undo(m);
-/*  unlockMark(&m); */
-  lTop = lSave;
-  aTop = aSave;
-  environment_frame = envSave;
+    for(n=0; n<arity; n++)
+      PL_get_arg(n+1, g, args+n);
 
-  return rval;
+    qid  = PL_open_query(module, flags, proc, args);
+    rval = PL_next_solution(qid);
+    if ( !rval && ex )
+      *ex = PL_exception(qid);
+    PL_cut_query(qid);
+
+    return rval;
+  }
 }
 
+
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Bring the Prolog system itself to life.  Prolog  saves  the  C-stack  to
-enable  aborts.   pl_abort()  will  close  open  files, reset all clause
-references to `0' and finally long_jumps back to prolog().
+Abort and toplevel. At the  moment,   prologToplevel()  sets a longjmp()
+context and pl_abort() jumps to this   context and resets the SWI-Prolog
+engine. 
+
+Using the multi-threaded version, this is   not  acceptable. Each thread
+needs such a context, but worse  is   that  we cannot properly reset the
+reference count and ensure locks are all in a sane state. 
+
+A cleaner solution is to  map  an   abort  onto  a Prolog exception. The
+exception-handling   code   should    ensure     proper    handling   of
+reference-counts and locks anyhow. Small disadvantage   is  that the old
+abort()   mechanism   was   capable   of     recovering   from   serious
+data-inconsistencies, while the throw-based requires   the Prolog engine
+to be in a sane state.  Anyhow,   in  the multi-threaded version we have
+little choice.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-static jmp_buf abort_context;		/* jmp buffer for abort() */
+#ifdef O_PLMT
+#define O_ABORT_WITH_THROW 1
+#endif
+
+static word
+pl_throw_abort()
+{ pl_notrace();
+
+  if ( GD->critical > 0 )		/* abort in critical region: delay */
+  { LD->aborted = TRUE;
+    succeed;
+  } else
+  { fid_t fid = PL_open_foreign_frame();
+    term_t ex = PL_new_term_ref();
+
+    PL_put_atom(ex, ATOM_aborted);
+    PL_throw(ex);			/* use longjmp() to ensure */
+
+    PL_close_foreign_frame(fid);	/* should not be reached */
+    fail;				
+  }
+}
+
+
+#ifdef O_ABORT_WITH_THROW
 
 word
-pl_abort()
-{ if (critical > 0)			/* abort in critical region: delay */
-  { aborted = TRUE;
+pl_abort(abort_type type)
+{ return pl_throw_abort();
+}
+
+#else /*O_ABORT_WITH_THROW*/
+
+static jmp_buf abort_context;		/* jmp buffer for abort() */
+static int can_abort;			/* embeded code can't abort */
+
+word
+pl_abort(abort_type type)
+{ if ( !can_abort ||
+       (trueFeature(EX_ABORT_FEATURE) && type == ABORT_NORMAL) )
+    return pl_throw_abort();
+
+  if ( GD->critical > 0 )		/* abort in critical region: delay */
+  { pl_notrace();
+    LD->aborted = TRUE;
     succeed;
   }
-  PopTty(&ttytab);
-  resetRead();
-  closeFiles();
+
+  if ( !trueFeature(READLINE_FEATURE) )
+    PopTty(Sinput, &ttytab);
+  LD->outofstack = NULL;
+  closeFiles(FALSE);
   resetReferences();
-  resetForeign();
-#if O_PROFILE
+#ifdef O_PROFILE
   pl_reset_profiler();
 #endif
+  resetStacks();
+  resetTracer();
+  resetSignals();
+  resetForeign();
+  resetAtoms();
 
   longjmp(abort_context, 1);
   /*NOTREACHED*/
   fail;
 }
 
+#endif /*O_ABORT_WITH_THROW*/
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Initial entry point from C to start  the  Prolog  engine.   Saves  abort
@@ -133,28 +225,81 @@ interpreter with the toplevel goal.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 bool
-prolog(goal)
-volatile word goal;
-{ if (setjmp(abort_context) != 0)
-  { goal = (word) ATOM_abort;
+prologToplevel(volatile atom_t goal)
+{ bool rval;
+  volatile int aborted = FALSE;
+
+#ifndef O_ABORT_WITH_THROW
+  if ( setjmp(abort_context) != 0 )
+  { if ( LD->current_signal )
+      unblockSignal(LD->current_signal);
+    
+    aborted = TRUE;
   } else
-  { debugstatus.debugging = FALSE;
+#endif
+  { debugstatus.debugging = DBG_OFF;
   }
 
-  lTop = (LocalFrame) addPointer(lBase, sizeof(LocalFrame));
-  varFrame(lTop, -1) = (word) NULL;
-  tTop = tBase;
-  gTop = gBase;
-  aTop = aBase;
-  pTop = pBase;
-  gc_status.blocked   = 0;
-  gc_status.requested = FALSE;
-  status.arithmetic   = 0;
+  emptyStacks();
 
-  debugstatus.tracing = FALSE;
+#ifdef O_LIMIT_DEPTH
+  depth_limit   = (unsigned long)DEPTH_NO_LIMIT;
+#endif
+
+  gc_status.blocked    = 0;
+  gc_status.requested  = FALSE;
+#if O_SHIFT_STACKS
+  shift_status.blocked = 0;
+#endif
+  LD->in_arithmetic    = 0;
+
+  tracemode(FALSE, NULL);
+  debugmode(DBG_OFF, NULL);
   debugstatus.suspendTrace = 0;
 
-  return interpret(MODULE_system, goal, FALSE);
+#ifndef O_ABORT_WITH_THROW
+  can_abort = TRUE;
+#endif
+  for(;;)
+  { fid_t fid = PL_open_foreign_frame();
+    qid_t qid;
+    term_t except = 0;
+    Procedure p;
+    word gn;
+
+    if ( aborted )
+    { aborted = FALSE;
+      gn = ATOM_abort;
+    } else
+      gn = goal;
+
+    p = lookupProcedure(lookupFunctorDef(gn, 0), MODULE_system);
+
+    qid = PL_open_query(MODULE_system, PL_Q_NORMAL, p, 0);
+    rval = PL_next_solution(qid);
+    if ( !rval && (except = PL_exception(qid)) )
+    { atom_t a;
+      
+      tracemode(FALSE, NULL);
+      debugmode(DBG_OFF, NULL);
+      if ( PL_get_atom(except, &a) && a == ATOM_aborted )
+      { printMessage(ATOM_informational, PL_ATOM, ATOM_aborted);
+      } else if ( !PL_is_functor(except, FUNCTOR_error2) )
+      { printMessage(ATOM_error,
+		     PL_FUNCTOR_CHARS, "unhandled_exception", 1,
+		       PL_TERM, except);
+      }
+    }
+    PL_close_query(qid);
+    PL_discard_foreign_frame(fid);
+    if ( !except )
+      break;
+  }
+#ifndef O_ABORT_WITH_THROW
+  can_abort = FALSE;
+#endif
+
+  return rval;
 }
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -162,242 +307,121 @@ Cut (!) as called via the  meta-call  mechanism has no effect.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 word
-pl_metacut()
+pl_metacut(void)
 { succeed;
 }
 
-
-		/********************************
-		*          UNIFICATION          *
-		*********************************/
-
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Unify is the general unification procedure.   This  raw  routine  should
-only be called by interpret as it does not undo bindings made during the
-unification  in  case  the  unification fails.  pl_unify() (implementing
-=/2) does undo bindings and should be used by foreign predicates.
-
-Unification depends on the datatypes available in the system and will in
-general need updating if new types are added.  It should be  noted  that
-unify()  is  not  the only place were unification happens.  Other points
-are:
-  - various of the virtual machine instructions
-  - various macros, for example APPENDLIST and CLOSELIST
-  - unifyAtomic(), unifyFunctor(): unification of atomic data.
-  - various builtin predicates. They should be flagged some way.
-
-The Gould does not accept the construct (word)t1 = *t1.  This implies we
-have to define extra variables, slowing down execution a bit (on the SUN
-this trick saves about 10% on this function).
+Just for debugging now and then.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-#if !O_NO_LEFT_CAST
-#define w1 ((word)t1)
-#define w2 ((word)t2)
-#endif
-
-bool
-unify(t1, t2)
-register Word t1, t2;
-{
-#if O_NO_LEFT_CAST
-  register word w1, w2;
-#endif
-
-  deRef(t1);  
-  deRef(t2);
-
-  if (isVar(*t1) )
-  { if (isVar(*t2) )
-    { if (t1 < t2)		/* always point downwards */
-      { Trail(t2);
-        *t2 = makeRef(t1);
-	succeed;
-      }
-      if (t1 == t2)
-	succeed;
-      Trail(t1);
-      *t1 = makeRef(t2);
-      succeed;
-    }
-    Trail(t1);
-    *t1 = *t2;
-    succeed;
-  }
-  if (isVar(*t2) )
-  { Trail(t2);
-    *t2 = *t1;
-    succeed;
-  }
-
-  if ( (w1 = *t1) == (w2 = *t2) )
-    succeed;
-  if ( mask(w1) != mask(w2) )
-    fail;
-
-  if ( mask(w1) != 0 )
-  { if ( !isIndirect(w1) )
-      fail;
-#if O_STRING
-    if ( isString(w1) && isString(w2) && equalString(w1, w2) )
-      succeed;
-#endif /* O_STRING */
-    if ( isReal(w1) && isReal(w2) && valReal(w1) == valReal(w2) )
-      succeed;
-    fail;
-  }
-
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Now both w1 and w2 can still represent a term or an atom.  If  both  are
-atoms  they are not the same atom.  We can do a quick and dirty test for
-atom as it is not a variable, nor a masked type.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-  { register int arity;
-    register FunctorDef fd;
-
-    if ( pointerIsAtom(w1) || 
-	 pointerIsAtom(w2) ||
-	 (fd = functorTerm(w1)) != functorTerm(w2) )
-      fail;
-
-    arity = fd->arity;
-    t1 = argTermP(w1, 0);
-    t2 = argTermP(w2, 0);
-    for(; arity > 0; arity--, t1++, t2++)
-      if (unify(t1, t2) == FALSE)
-	fail;
-  }
-
-  succeed;
+int
+trap_gdb()
+{ return 0;
 }
 
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-unify_atomic(p, a) is normally called through unifyAtomic(). It  unifies
-a  term,  represented  by  a pointer to it, with an atomic value.  It is
-intended for foreign language functions.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-bool
-unify_atomic(p, a)
-register Word p;
-word a;
-{ deRef(p);
-
-  if (*p == a)
-    succeed;
-
-  if (isVar(*p) )
-  { Trail(p);
-    *p = a;
-    succeed;
-  }
-
-  if (isIndirect(a) && isIndirect(*p) )
-  { if (isReal(a) && isReal(*p) && valReal(a) == valReal(*p))
-      succeed;
-#if O_STRING
-    if (isString(a) && isString(*p) && equalString(a, *p))
-      succeed;
-#endif /* O_STRING */
-  }
-
-  fail;
-}
-
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Unify a (pointer to a) term with a functor (is name/arity pair).  If the
-term is instantiated to a term of the name and arity  indicated  by  the
-functor  this  call just succeeds.  If the term is a free variable it is
-bound to a term whose arguments are all variables.  Otherwise this  call
-fails.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-bool
-unifyFunctor(term, functor)
-register Word term;
-register FunctorDef functor;
-{ if (functor->arity == 0)
-    return unifyAtomic(term, functor->name);
-
-  deRef(term);
-
-  if (isVar(*term) )
-  { Trail(term);
-    *term = globalFunctor(functor);
-    succeed;
-  }
-  if (isTerm(*term) && functorTerm(*term) == functor)
-    succeed;
-
-  fail;
-}
+#if O_SECURE || O_DEBUG || defined(O_MAINTENANCE)
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 checkData(p) verifies p points to valid  Prolog  data  and  generates  a
 system  error  otherwise.  The checks performed are much more rigid than
 those during normal execution.  Arity of terms is limited to  100  as  a
 kind of heuristic.
-
-Note that we expect terms on the global stack.   This  is  true  in  the
-interpreter,  but  not everywere in the system (records use terms on the
-heap).
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-#define onGlobal(p) ((char *)p >= (char *)gBase && (char *)p <= (char *)gTop)
-#define onLocal(p) ((char *)p >= (char *)lBase && (char *)p <= (char *)lTop)
-#define onHeap(  p) ((char *)p >= (char *)hBase && (char *)p <= (char *)hTop)
+#define onGlobal(p) onStack(global, p)
+#define onLocal(p) onStack(local, p)
+#define onHeap(p) ((char *)p >= (char *)hBase && (char *)p <= (char *)hTop)
 
-#if TEST
-void
-checkData(p)
-register Word p;
+static void
+printk(char *fm, ...)
+{ va_list args;
+
+  va_start(args, fm);
+  Sfprintf(Serror, "[DATA INCONSISTENCY: ");
+  Svfprintf(Serror, fm, args);
+  Sfprintf(Serror, "]\n");
+  va_end(args);
+
+  trap_gdb();
+}
+
+
+word
+checkData(Word p)
 { int arity; int n;
-  register Word p2;
+  Word p2;
 
-  if (isVar(*p))
-    return;
   while(isRef(*p))
   { p2 = unRef(*p);
-    if (p2 > p)
-      sysError("Reference to higher address");
-    if (!onLocal(p2) && !onGlobal(p2) && !onHeap(p2))
-      sysError("Illegal reference pointer: 0x%x", *p);
+    if ( p2 > p )
+      printk("Reference to higher address");
+    if ( !onLocal(p2) && !onGlobal(p2) )
+      printk("Illegal reference pointer at 0x%x --> 0x%x", p, p2);
+
     return checkData(p2);
   }
-  if ((*p & MASK_MASK) == INT_MASK)
-    return;
-  if ((*p & MASK_MASK) == REAL_MASK)
-  { p2 = (Word)unMask(*p);
-    if (!onGlobal(p2) && !onHeap(p2))
-      sysError("Illegal real: 0x%x", *p);
-    return;
-  }
-#if O_STRING
-  if ((*p & MASK_MASK) == STRING_MASK)
-  { p2 = (Word)unMask(*p);
-    if (!onGlobal(p2) && !onHeap(p2))
-      sysError("Illegal string: 0x%x", *p);
-    if ( sizeString(*p) != strlen(valString(*p)) )
-      sysError("String has inconsistent length: 0x%x", *p);
-    return;
-  }
-#endif /* O_STRING */
-  if (onHeap(*p) && !onGlobal(*p))
-  { if (((Atom)(*p))->type != ATOM_TYPE)
-      sysError("Illegal atom: 0x%x", *p);
-    succeed;
-  }
-  if (!onGlobal(*p))
-    warning("Term not on global stack: 0x%x", *p);
-  if (functorTerm(*p)->type != FUNCTOR_TYPE)
-    sysError("Illegal term: 0x%x", *p);
-  arity = functorTerm(*p)->arity;
-  if (arity <= 0 || arity > 100)
-    sysError("Illegal arity");
-  for(n=0; n<arity; n++)
-    checkData(argTermP(*p, n));
 
-  return;
+  if ( isVar(*p) )
+    return 0x737473;			/* just a random number */
+
+  if ( isTaggedInt(*p) )
+    return *p;
+
+  if ( isIndirect(*p) )
+  { Word a = addressIndirect(*p);
+
+    if ( !onGlobal(a) )
+      printk("Indirect at %p not on global stack", a);
+    if ( storage(*p) != STG_GLOBAL )
+      printk("Indirect data not on global");
+    if ( isBignum(*p) )
+      return (word) valBignum(*p);
+    if ( isReal(*p) )
+      return (word) valReal(*p);
+    if ( isString(*p) )
+    { long sz, len;
+
+      if ( (sz=sizeString(*p)) != (len=strlen(valString(*p))) )
+      { if ( sz < len )
+	  printk("String has inconsistent length: 0x%x", *p);
+	else if ( valString(*p)[sz] )
+	  printk("String not not followed by NUL-char: 0x%x", *p);
+/*	else
+	  printf("String contains NUL-chars: 0x%x", *p);
+*/
+      }
+      return *addressIndirect(*p);
+    }
+    printk("Illegal indirect datatype");
+  }
+
+  if ( isAtom(*p) )
+  { if ( storage(*p) != STG_STATIC )
+      printk("Atom doesn't have STG_STATIC");
+    return *p;
+  }
+					/* now it should be a term */
+  if ( tag(*p) != TAG_COMPOUND ||
+       storage(*p) != STG_GLOBAL )
+    printk("Illegal term at: %p: 0x%x", p, *p);
+
+  { word key = 0L;
+    Functor f = valueTerm(*p);
+
+    if ( !onGlobal(f) )
+      printk("Term at %p not on global stack", f);
+      
+    if ( tag(f->definition) != TAG_ATOM ||
+         storage(f->definition) != STG_GLOBAL )
+      printk("Illegal term: 0x%x", *p);
+    arity = arityFunctor(f->definition);
+    if (arity <= 0 || arity > 256)
+      printk("Dubious arity (%d)", arity);
+    for(n=0; n<arity; n++)
+      key += checkData(&f->arguments[n]);
+
+    return key;
+  }
 }
 #endif /* TEST */

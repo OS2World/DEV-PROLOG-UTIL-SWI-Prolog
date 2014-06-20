@@ -1,0 +1,46 @@
+**************************
+* OS/2 Port - 16.08.2001 *
+**************************
+
+SWI-Prolog 4.0.9 has been ported to IBM OS/2 Warp by Massimiliano Campagnoli (maxi@paoloastori.com)
+
+-------------------
+How to run:
+-------------------
+1) you must have emx.dll installed.
+2) unzip plos2.zip
+3) cd \pl-4-0.9\src
+4) pl.exe
+
+Please refer to SWI-Prolog 4.0 Reference Manual for details on how to use SWI-Prolog.
+You can download this manual from http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+
+-------------------
+How to compile:
+-------------------
+1) Install emx, gcc, sed and awk as described in their documentations.
+2) unzip plos2.zip
+3) cd \pl-4.0.9\src 
+4) make
+
+-------------------
+Known limitations:
+-------------------
+Foreign language interface via dynamic linking is not supported yes;
+use static linking instead (refer to SWI-Prolog 4.0 chapter 5).
+
+-------------------
+Bugs:
+-------------------
+The porting has not been fully tested.
+Please report to maxi@paoloastori.com any bug or question related to this port.
+
+-------------------
+Credits:
+-------------------
+Jan Wielemaker is the author of SWI-Prolog (see README).
+This port is based on the initial porting effort by Andreas T"onne (see README.OS2).
+
+
+
+

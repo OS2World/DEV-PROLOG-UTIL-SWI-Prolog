@@ -1,4 +1,4 @@
-/*  profile.pl,v 1.2 1992/10/25 16:30:52 jan Exp
+/*  $Id: profile.pl,v 1.3 1999/11/10 14:28:36 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -73,9 +73,8 @@ profile(Goal, Style, N) :-
 	profiler(_, off), 
 	show_profile(N), !, 
 	Rval == true.
-profile(_, _, _) :-
-	$warning('profile/3: second argument should be one of {plain, cumulative}'), 
-	fail.
+profile(_, Style, _) :-
+	throw(error(domain_error(profile_type, Style), _)).
 
 $time_rval(Goal, true) :-
 	time(Goal), !.

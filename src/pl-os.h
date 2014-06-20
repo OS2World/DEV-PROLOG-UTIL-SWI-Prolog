@@ -1,64 +1,27 @@
-/*  pl-os.h,v 1.10 1993/02/23 13:16:40 jan Exp
+/*  $Id: pl-os.h,v 1.47 2000/10/23 11:39:42 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Describe your OS here
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
-#ifdef TIME_INCLUDE
-#include TIME_INCLUDE
+#if TIME_WITH_SYS_TIME
+# include <sys/time.h>
+# include <time.h>
 #else
-#include <sys/time.h>
+# if HAVE_SYS_TIME_H
+#  include <sys/time.h>
+# else
+#  include <time.h>
+# endif
 #endif
-
-#if tos
-struct timeval
-{ long tv_sec;
-  long tv_usec;
-};
-#endif
-
-
-
-		/********************************
-		*             OS-TYPES		*
-		********************************/
-
-extern int	puti P((int, FILE *));
-extern int	geti P((FILE *));
-
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-The types below should (mostly) be in stdlib.h.  They are not and this
-file keeps GCC silent while using the -Wall flag.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-#if sun
-extern int	getpid P((void));
-extern int	isatty P((int));
-extern int	fclose P(( FILE * ));
-extern int	pclose P((FILE *));
-extern int	_filbuf P((FILE *));
-extern int	_flsbuf P((unsigned char, FILE *));
-extern int	fflush P((FILE *));
-extern char *   vsprintf P((char *, char *, va_list));
-extern void	bzero P((Void, int));
-extern void	exit P((int));
-extern int	close P((int));
-extern int	read P((int, Void, int));
-extern int	access P((char *, int));
-extern unsigned	sleep P((unsigned));
-extern int	fprintf P((FILE *, char *, ...));
-extern int	printf P((char *, ...));
-extern long	putw P((long, FILE *));
-extern long	getw P((FILE *));
-extern char *	index P((char *, char));
-extern int	write P((int, Void, int));
-extern int	gettimeofday P((struct timeval *, struct timeval *));
-extern long	strtol P((char *, char**, int));
-extern int	vfprintf P((FILE *, char *, ...));
-extern int	vfork P((void));
+#ifdef HAVE_SYS_PARAM_H			/* get MAXPATHLEN */
+#include <sys/param.h>
 #endif
 
 
@@ -66,42 +29,20 @@ extern int	vfork P((void));
 		*        MEMORY MANAGEMENT      *
 		*********************************/
 
-#if !ANSI
-#define memcpy(to, from, n)	bcopy(from, to, n)
-#endif
-
-
-#define malloc_t	size_t		/* Argument type of malloc(), etc */
-#define alloc_t		size_t		/* argument type of Prolog's alloc */
-
-#define Malloc(n)	malloc((malloc_t) (n))
-#define Free(p)		free((char *)(p))
-#define Realloc(p, n)	realloc((char *)p, (malloc_t)(n))
-
-#define allocHeap(n)	alloc_heap((alloc_t) (n))
-#define freeHeap(p, n)	free_heap((char *)(p), (alloc_t)(n))
-#define allocGlobal(n)	alloc_global((alloc_t) (n))
-#define allocLocal(n)	alloc_local((alloc_t) (n))
-
-extern Void Allocate P((long));
+extern Void Allocate(long);
 
 		/********************************
 		*         MISCELLANEOUS         *
 		*********************************/
 
-extern char *Setenv P((char *name, char *value));
-extern char *Unsetenv P((char *name));
-
-extern long Time P((void));
-extern char *OsError P((void));
-extern bool initOs P((void));
-extern volatile void Halt P((int));
+extern char *OsError(void);
+extern bool initOs(void);
 
 		/********************************
 		*           ARITHMETIC          *
 		*********************************/
 
-extern long Random P((void));
+extern long Random(void);
 
 
 		/********************************
@@ -116,78 +57,98 @@ extern long Random P((void));
 #define STREAM_OPEN_BIN_WRITE "wb"
 #endif
 
-#if unix
+#ifdef HAVE_POPEN
 #define PIPE 1
-#define Popen(path, m)	popen(OsPath(path), m)
-#define Pclose(fd)	pclose(fd)
-#endif
-#if OS2 && EMX
-#define PIPE 1
-#define Popen(path, m)	popen(OsPath(path), m)
+#define Popen(path, m)	Sopen_pipe(OsPath(path), m)
 #define Pclose(fd)	pclose(fd)
 #endif
 
-#if tos
-#define MAXPATHLEN	PATH_MAX
+#ifndef MAXPATHLEN
+#ifdef PATH_MAX
+#define MAXPATHLEN PATH_MAX
+#else
+#ifdef PATHSIZE
+#define MAXPATHLEN PATHSIZE
+#endif
+#endif
 #endif
 
 
-#define Fflush(fd)		fflush(fd)
-#define Fopen(path, m)		fopen(OsPath(path), m)
-#define Fclose(fd)		fclose(fd)
+#define Fflush(fd)		Sflush(fd)
+#define Fclose(fd)		Sclose(fd)
 #define Open(path, how, mode)	open(OsPath(path), how, mode)
-#define Close(fd)		close(fd)
 #define Read(fd, buf, size)	read(fd, buf, size)
 #define Write(fd, buf, size)	write(fd, buf, size)
-#define Getc(fd)		getc(fd)
-#define Putc(c, fd)		putc((char)(c), fd)
-#define Putw(w, fd)		putw((long)(w), fd)
-#define Getw(fd)		getw(fd)
+#define Getc(fd)		Sgetc(fd)
+#define Putw(w, fd)		Sputw((long)(w), fd)
+#define Getw(fd)		Sgetw(fd)
 
-Char		GetChar P((void));
-Atom		TemporaryFile P((char *key));
-void		RemoveTemporaryFiles P((void));
-int		GetDTableSize P((void));
-long		LastModifiedFile P((char *name)),
-		SizeFile P((char *name));
-bool		AccessFile P((char *name, int how)),
-		ExistsFile P((char *name)),
-		ExistsDirectory P((char *name)),
-		DeleteFile P((char *name)),
-		RenameFile P((char *old, char *new)),
-		SameFile P((char *file1, char *file2)),
-		OpenStream P((int index)),
-		MarkExecutable P((char *name)),
-		expandVars P((char *pattern, char *expanded)),
-		ChDir P((char *dir));
-char 		*AbsoluteFile P((char *)),
-		*ExpandOneFile P((char *)),
-		*BaseName P((char *)),
-		*DirName P((char *)),
-		*PrologPath P((char *)),
-		*OsPath P((char *));
+		 /*******************************
+		 *      PAGE AND TABLE-SIZE	*
+		 *******************************/
 
+#ifdef HAVE_SYSCONF
+#if defined(_SC_OPEN_MAX) && !defined(HAVE_GETPAGESIZE)
+#undef getdtablesize
+#define getdtablesize() sysconf(_SC_OPEN_MAX)
+#ifndef HAVE_GETDTABLESIZE
+#define HAVE_GETDTABLESIZE 1
+#endif
+#endif
+#if defined(_SC_PAGESIZE) && !defined(HAVE_GETPAGESIZE)
+#undef getpagesize
+#define getpagesize() sysconf(_SC_PAGESIZE)
+#ifndef HAVE_GETPAGESIZE
+#define HAVE_GETPAGESIZE 1
+#endif
+#endif
+#endif /*HAVE_SYSCONF*/
+
+#ifndef HAVE_GETDTABLESIZE
+extern int	getdtablesize(void);
+#endif
+#ifndef HAVE_GETPAGESIZE
+extern int	getpagesize(void);
+#endif
+
+		 /*******************************
+		 *	    FILE ACCESS		*
+		 *******************************/
+
+#define ACCESS_EXIST	0
 #define ACCESS_EXECUTE	1
 #define ACCESS_READ	2
 #define ACCESS_WRITE	4
+
+		 /*******************************
+		 *               TYPES		*
+		 *******************************/
+
+#if 0 && defined(__sun__) && defined(__svr4__)
+extern long random(void);
+extern int srandom(unsigned seed);
+#endif
 
 		/********************************
 		*        TIME CONVERSION        *
 		*********************************/
 
-extern struct tm *LocalTime P((long *));
-extern real	  CpuTime P((void));
+extern struct tm *LocalTime(long *);
+extern real	  CpuTime(void);
 
 
 		/********************************
-		*       FILE DESCR. SETS	*
+		*       IOSTREAM DESCR. SETS	*
 		********************************/
 
 #ifndef FD_ZERO
-/* typedef ulong fd_set;		prior SunOs 4.0 compatibility */
-#define FD_ZERO(s)	{ *((ulong *)(s)) = (0L); }
-#define FD_SET(fd, s)	{ *((ulong *)(s)) |= (1L << (fd)); }
-#define FD_ISSET(fd, s) ( (*((ulong *)(s)) & (1L << (fd))) != 0 )
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#else
+#define FD_ZERO(s)	{ *((unsigned long *)(s)) = (0L); }
+#define FD_SET(fd, s)	{ *((unsigned long *)(s)) |= (1L << (fd)); }
+#define FD_ISSET(fd, s) ( (*((unsigned long *)(s)) & (1L << (fd))) != 0 )
+#endif
 #endif
 
 		/********************************
@@ -195,95 +156,60 @@ extern real	  CpuTime P((void));
 		*********************************/
 
 #define TTY_COOKED	 1		/* Initial mode: echo */
-#define TTY_EXTEND_ATOMS 2		/* Atom-completion Mode: echo */
-#define TTY_APPEND	 3		/* Add input from Prolog: echo */
-#define TTY_RAW		 4		/* Non-blocking, non-echo */
-#define TTY_RETYPE	 5		/* Retype input: non-echo */
-#define	TTY_SAVE	 6		/* Save parameters only */
+#define TTY_RAW		 2		/* Non-blocking, non-echo */
+#define TTY_OUTPUT	 3		/* enable post-processing */
+#define TTY_SAVE	 4		/* just save status */
 
-#if unix
-#if O_TERMIOS
-#ifdef TERMIO_INCLUDE
-#include TERMIO_INCLUDE
+#ifdef HAVE_TCSETATTR
+#include <termios.h>
+#include <unistd.h>
+#define O_HAVE_TERMIO 1
+#else /*HAVE_TCSETATTR*/
+#ifdef HAVE_SYS_TERMIO_H
+#include <sys/termio.h>
+#define termios termio
+#define O_HAVE_TERMIO 1
 #else
-#include <sys/termio.h>
+#ifdef HAVE_SYS_TERMIOS_H
+#include <sys/termios.h>
+#define O_HAVE_TERMIO 1
 #endif
+#endif
+#endif /*HAVE_TCSETATTR*/
+
+#ifdef O_HAVE_TERMIO
 
 typedef struct
-{ struct termio tab;		/* saved tty status */
+{ struct termios tab;		/* saved tty status */
   int		mode;		/* Prolog;'s view on mode */
 } ttybuf;
 
-#else /* O_TERMIOS */
+#else /* !O_HAVE_TERMIO */
 
-#include <sgtty.h>
-
+#ifdef HAVE_SGTTYB
+#include <sys/ioctl.h>
 typedef struct
-{ struct sgttyb tab;		/* saved tty flags */
-  struct tchars chars;		/* tty characters */
-  int		mode;		/* Prolog's view on mode */
-} ttybuf;
-#endif /* O_TERMIOS */
-
-#elif OS2 && EMX
-#if O_TERMIOS
-#include <sys/termio.h>
-#include <sys/kbdscan.h>
-
-
-typedef struct
-{ struct termio tab;		/* saved tty status */
+{ struct sgttyb tab;		/* saved tty status */
   int		mode;		/* Prolog;'s view on mode */
 } ttybuf;
 
-#else /* ! O_TERMIOS */
-
-#include <sgtty.h>
+#else
 
 typedef struct
-{ struct sgttyb tab;		/* saved tty flags */
-  struct tchars chars;		/* tty characters */
-  int		mode;		/* Prolog's view on mode */
+{ int		mode;		/* Prolog;'s view on mode */
 } ttybuf;
-#endif /* O_TERMIOS */
 
-#else /* OS2 */
-typedef struct
-{ int		mode;		/* Prolog's view on mode */
-} ttybuf;
-#endif /* unix */
+#endif /*HAVE_SGTTYB*/
+#endif /*O_HAVE_TERMIO*/
 
 extern ttybuf	ttytab;			/* saved tty status */
 extern int	ttymode;		/* Current tty mode */
 
-#if O_LINE_EDIT
-#define QSIZE (256)
-extern struct tty_driver
-{ char  werase;         /* word erase character */
-  char  kill;           /* kill character */
-  char  erase;          /* erase character */
-  char  erase2;         /* alternative erase character */
-  char  eol;            /* alternative end-of-line */
-  char  eol2;           /* 2nd alternative end-of-line */
-  char  reprint;        /* reprint input */
-  char  intr;           /* interrupt */
-  int   mode;           /* mode of the driver */
-  int   emitting;       /* Lines available */
-  bool  isatty;         /* stdin actually is a terminal? */
-  int   column;         /* current cursor column */
-  int   in;             /* in-pointer in queue */
-  int   out;            /* out-pointer in queue */
-  short flags;          /* FLAGS */
-  char  queue[QSIZE];   /* character queue */
-} stdin_driver ;
-#endif /* O_LINE_EDIT */
 #define IsaTty(fd)	isatty(fd)
 
-extern bool PushTty P((ttybuf *, int mode));
-extern bool PopTty P((ttybuf *));
-extern void PretendTyped P((char));
-extern void ResetTty P((void));
-extern void TtyAddChar P((Char));
+extern bool PushTty(IOSTREAM *s, ttybuf *, int mode);
+extern bool PopTty(IOSTREAM *s, ttybuf *);
+extern void ResetTty(void);
 
 
 		/********************************
@@ -292,6 +218,4 @@ extern void TtyAddChar P((Char));
 
 #define Wait(stat)	wait(stat)
 
-extern int System P((char *command));
-extern void Sleep P((real time));
-extern char *Symbols P((void));
+extern int System(char *command);

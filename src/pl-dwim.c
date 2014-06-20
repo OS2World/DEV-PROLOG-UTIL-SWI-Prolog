@@ -1,22 +1,25 @@
-/*  pl-dwim.c,v 1.1.1.1 1992/05/26 11:52:17 jan Exp
+/*  $Id: pl-dwim.c,v 1.14 2000/02/17 11:56:22 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Do What I Mean support functions
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #include "pl-incl.h"
 #include "pl-ctype.h"
 
-forwards Atom	dwimMatch P((char *, char *));
-forwards bool	oneTypo P((char *, char *));
-forwards bool	twoTransposed P((char *, char *));
-forwards bool	oneInserted P((char *, char *));
-forwards bool	differentSeparated P((char *, char *));
-forwards char *	subWord P((char *, char *));
-forwards bool	subwordsTransposed P((char *, char *));
+forwards atom_t	dwimMatch(char *, char *);
+forwards bool	oneTypo(char *, char *);
+forwards bool	twoTransposed(char *, char *);
+forwards bool	oneInserted(char *, char *);
+forwards bool	differentSeparated(char *, char *);
+forwards char *	subWord(char *, char *);
+forwards bool	subwordsTransposed(char *, char *);
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Strings are supposed to be meant identical iff one of the  following  is
@@ -30,15 +33,14 @@ the case:
   - Two `Sub-words' have been transposed	(exists_file == file_exists)
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-static Atom
-dwimMatch(str1, str2)
-char *str1, *str2;
-{ int l1, l2;
+static atom_t
+dwimMatch(char *str1, char *str2)
+{ int cl=0, l1, l2;
   register char *s1 = str1;
   register char *s2 = str2;
 
   while(*s1 && *s1 == *s2)			/* delete common part */
-    s1++, s2++;
+    s1++, s2++, cl++;
   l2 = (int) strlen(s2);
   l1 = (int) strlen(s1);
 
@@ -46,8 +48,7 @@ char *str1, *str2;
     fail;
   
   if ( l1 == 0 && l2 == 0 )			return ATOM_equal;
-  if ( (s1[0] == EOS || s1[1] == EOS || s1[2] == EOS) ||
-       (s2[0] == EOS || s2[1] == EOS || s2[2] == EOS))
+  if ( cl + l1 < 3 || cl + l2 < 3 )
     fail;
   if ( l1 == l2 && oneTypo(s1, s2) )		return ATOM_mismatched_char;
   if ( l1 == l2 && twoTransposed(s1, s2) )	return ATOM_transposed_char;
@@ -60,8 +61,7 @@ char *str1, *str2;
 }
 
 static bool
-oneTypo(s1, s2)
-char *s1, *s2;
+oneTypo(char *s1, char *s2)
 { if (s1[1] == EOS || streq(&s1[1], &s2[1]) )
     succeed;
   fail;
@@ -69,8 +69,7 @@ char *s1, *s2;
 
 static
 bool
-twoTransposed(s1, s2)
-register char *s1, *s2;
+twoTransposed(register char *s1, register char *s2)
 { if (s1[1] != EOS && s1[0] == s2[1] && s1[1] == s2[0] &&
        (s1[2] == EOS || streq(&s1[2], &s2[2])))
     succeed;
@@ -78,16 +77,14 @@ register char *s1, *s2;
 }
 
 static bool
-oneInserted(s1, s2)
-register char *s1, *s2;
+oneInserted(register char *s1, register char *s2)
 { if (streq(s1, &s2[1]) )
     succeed;
   fail;
 }
 
 static bool
-differentSeparated(s1, s2)
-register char *s1, *s2;
+differentSeparated(register char *s1, register char *s2)
 { register char c1, c2;
 
   if ( *s1 != *s2 || *s1 == EOS )
@@ -99,13 +96,13 @@ register char *s1, *s2;
     { c1 = *++s1;
     } else
     { if (isLower(s1[-1]) && isUpper(c1))
-        c1 = toLower(c1);
+        c1 = makeLower(c1);
     }
     if ((c2 = *++s2) == '_')
     { c2 = *++s2;
     } else
     { if (isLower(s2[-1]) && isUpper(c2))
-	c2 = toLower(c2);
+	c2 = makeLower(c2);
     }
   }
   if (c1 == EOS && c2 == EOS)
@@ -114,9 +111,8 @@ register char *s1, *s2;
 }
 
 static char *
-subWord(s, store)
-register char *s, *store;
-{ *store++ = (isUpper(*s) ? toLower(*s) : *s);
+subWord(register char *s, register char *store)
+{ *store++ = makeLower(*s);
   s++;
 
   for(;;)
@@ -137,8 +133,7 @@ register char *s, *store;
 }    
 
 static bool
-subwordsTransposed(s1, s2)
-char *s1, *s2;
+subwordsTransposed(char *s1, char *s2)
 { char sw1a[1024], sw1b[1024];
   char sw2a[1024], sw2b[1024];
 
@@ -164,23 +159,17 @@ char *s1, *s2;
 		*********************************/
 
 word
-pl_dwim_match(a1, a2, mm)
-Word a1, a2, mm;
-{ char *s1, *s2 = NULL;		/* initialise to make gcc happy */
-  bool rval;
-  Atom type;
+pl_dwim_match(term_t a1, term_t a2, term_t mm)
+{ char *s1, *s2;
+  atom_t type;
 
-  initAllocLocal();
-  rval = ((s1 = primitiveToString(*a1, TRUE)) != (char *)NULL &&
-	  (s2 = primitiveToString(*a2, TRUE)) != (char *)NULL);
-  stopAllocLocal();
-  if ( !rval )
-    fail;
-
-  if ( (type = dwimMatch(s1, s2)) == (Atom) NULL )
-    fail;
-
-  return unifyAtomic(mm, type);
+  if ( PL_get_chars(a1, &s1, CVT_ALL|BUF_RING) &&
+       PL_get_chars(a2, &s2, CVT_ALL|BUF_RING) &&
+       (type = dwimMatch(s1, s2)) &&
+       PL_unify_atom(mm, type) )
+    succeed;
+    
+  fail;
 }
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -190,46 +179,48 @@ predicate head.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 word
-pl_dwim_predicate(term, dwim, h)
-Word term, dwim;
-word h;
-{ FunctorDef fdef;
+pl_dwim_predicate(term_t pred, term_t dwim, word h)
+{ functor_t fdef;
   Module module = (Module) NULL;
   Procedure proc;
   Symbol symb;
+  term_t head = PL_new_term_ref();
+  TableEnum e;
 
   if ( ForeignControl(h) == FRG_CUTTED )
+  { e = ForeignContextPtr(h);
+    freeTableEnum(e);
     succeed;
+  }
 
-  if ((term = stripModule(term, &module)) == (Word) NULL)
+  if ( !PL_strip_module(pred, &module, head) )
     fail;
-
-  if (isAtom(*term) )
-    fdef = lookupFunctorDef((Atom)*term, 0);
-  else if (isTerm(*term) )
-    fdef = functorTerm(*term);
-  else
-    return warning("dwim_predicate/2: illegal term specification");
+  if ( !PL_get_functor(head, &fdef) )
+    return PL_error(NULL, 0, NULL, ERR_TYPE, ATOM_callable, head);
   	
   if ( ForeignControl(h) == FRG_FIRST_CALL )
-    symb = firstHTable(module->procedures);
+    e = newTableEnum(module->procedures);
   else
-    symb = (Symbol) ForeignContextAddress(h);
+    e = ForeignContextPtr(h);
 
-  for(; symb; symb = nextHTable(module->procedures, symb))
-  { proc = (Procedure) symb->value;
-    if ( dwimMatch(stringAtom(fdef->name), stringAtom(proc->functor->name)) &&
+  while( (symb = advanceTableEnum(e)) )
+  { Definition def;
+    char *name;
+
+    proc = symb->value;
+    def  = proc->definition;
+    name = stringAtom(def->functor->name);
+
+    if ( dwimMatch(stringAtom(nameFunctor(fdef)), name) &&
          isDefinedProcedure(proc) &&
-         (stringAtom(proc->functor->name)[0] != '$' ||
-	   SYSTEM_MODE) )
-    { if (unifyFunctor(dwim, proc->functor) == FALSE)
+         (name[0] != '$' || SYSTEM_MODE) )
+    { if ( !PL_unify_functor(dwim, def->functor->functor) )
 	continue;
-      if ((symb = nextHTable(module->procedures, symb)) != (Symbol) NULL)
-	ForeignRedo(symb);
 
-      succeed;
+      ForeignRedoPtr(e);
     }
   }
 
+  freeTableEnum(e);
   fail;
 }

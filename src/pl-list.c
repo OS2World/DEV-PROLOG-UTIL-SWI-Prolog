@@ -1,135 +1,147 @@
-/*  pl-list.c,v 1.1.1.1 1992/05/26 11:52:22 jan Exp
+/*  $Id: pl-list.c,v 1.10 2000/07/04 11:59:18 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: List manipulation predicates in C
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #include "pl-incl.h"
 
 word
-pl_is_list(list)
-Word list;
-{ if ( isList(*list) || isNil(*list) )
+pl_is_list(term_t list)
+{ Word p = valTermRef(list);
+
+  deRef(p);
+
+  if ( isList(*p) || isNil(*p) )
     succeed;
 
   fail;
 }
 
+
 word
-pl_proper_list(list)
-Word list;
-{ if ( lengthList(list) >= 0 )
+pl_proper_list(term_t list)
+{ if ( lengthList(list, FALSE) >= 0 )
     succeed;
 
   fail;
 }
 
+
 word
-pl_length(list, l)
-Word list, l;
-{ if ( isInteger(*l) )
-  { long n = valNum(*l);
-    if ( n < 0 )
-      fail;
-    while( n-- > 0 )
-    { TRY( unifyFunctor(list, FUNCTOR_dot2) );
-      list = TailList(list); deRef(list);
+pl_length(term_t list, term_t l)
+{ int n;
+
+  if ( PL_get_integer(l, &n) )
+  { if ( n >= 0 )
+    { term_t h = PL_new_term_ref();
+      term_t l = PL_copy_term_ref(list);
+
+      while( n-- > 0 )
+      { TRY(PL_unify_list(l, h, l));
+      }
+
+      return PL_unify_nil(l);
     }
-    CLOSELIST(list);
-    succeed;
+    fail;
   }
 
-  if ( isVar(*l) )
+  if ( PL_is_variable(l) )
   { long n;
   
-    if ( (n=lengthList(list)) >= 0 )
-      return unifyAtomic(l, consNum(n));
+    if ( (n=lengthList(list, FALSE)) >= 0 )
+      return PL_unify_integer(l, n);
+
     fail;			/* both variables: generate in Prolog */
   }
   
-  return warning("length/2: instantiation fault");
+  return PL_error("length", 2, NULL, ERR_TYPE, ATOM_integer, l);
 }  
 
 
 word
-pl_memberchk(e, list)
-Word e, list;
-{ for(;;)
-  { TRY( unifyFunctor(list, FUNCTOR_dot2) );
-    if ( pl_unify(e, HeadList(list)) == TRUE )
+pl_memberchk(term_t e, term_t list)
+{ term_t h = PL_new_term_ref();
+  term_t l = PL_copy_term_ref(list);
+
+  for(;;)
+  { TRY(PL_unify_list(l, h, l));
+      
+    if ( PL_unify(e, h) )
       succeed;
-    list = TailList(list);
-    deRef(list);
   }
 }
 
-forwards int	qsort_compare_standard P((Word *, Word *));
-forwards Word	*list_to_sorted_array P((Word, int *));
 
 static int
-qsort_compare_standard(p1, p2)
-Word *p1, *p2;
-{ return compareStandard(*p1, *p2);
+qsort_compare_standard(const void *p1, const void *p2)
+{ return compareStandard((Word) p1, (Word) p2);
 }
 
-static Word *
-list_to_sorted_array(list, size)
-Word list;
-int *size;
-{ int n = lengthList(list);
-  Word *array, *a;
+
+static term_t
+list_to_sorted_array(term_t List, int *size)
+{ int n = lengthList(List, TRUE);
+  term_t rval;
+  term_t list = PL_copy_term_ref(List);
+  term_t head = PL_new_term_ref();
+  int i;
 
   if ( n < 0 )
     fail;			/* not a proper list */
-  initAllocLocal();
-  array = (Word *)allocLocal(n * sizeof(Word));
-  stopAllocLocal();
-  for(a=array; isList(*list); a++)
-  { *a = HeadList(list);
-    deRef(*a);
-    list = TailList(list);
-    deRef(list);
-  }
-  SECURE(if (!isNil(*list)) sysError("list_to_sorted_array()"));
-  qsort(array, n, sizeof(Word), qsort_compare_standard);
+  rval = PL_new_term_refs(n);
+  
+  for(i=0; PL_get_list(list, head, list); i++)
+    PL_put_term(rval+i, head);
+
+  qsort(valTermRef(rval), n, sizeof(word), qsort_compare_standard);
   
   *size = n;
-  return array;
+  return rval;
 }
 
 
 word
-pl_msort(list, sorted)
-Word list, sorted;
-{ Word *array;
-  int n;
+pl_msort(term_t list, term_t sorted)
+{ term_t array;
+  term_t l = PL_copy_term_ref(sorted);
+  term_t h = PL_new_term_ref();
+  int n, i;
 
-  if ( (array=list_to_sorted_array(list, &n)) == (Word *) NULL )
-    return warning("msort/1: first argument is not a proper list");
-  for(; n > 0; n--, array++)
-    APPENDLIST(sorted, *array);
-  CLOSELIST(sorted);
-  
-  succeed;
+  if ( !(array = list_to_sorted_array(list, &n)) )
+    fail;
+  for(i=0; i < n; i++)
+  { if ( !PL_unify_list(l, h, l) ||
+	 !PL_unify(h, array+i) )
+      fail;
+  }
+
+  return PL_unify_nil(l);
 }
 
 
 word
-pl_sort(list, sorted)
-Word list, sorted;
-{ Word *array;
+pl_sort(term_t list, term_t sorted)
+{ term_t array;
+  term_t l = PL_copy_term_ref(sorted);
+  term_t h = PL_new_term_ref();
   int n, size;
 
-  if ( (array=list_to_sorted_array(list, &size)) == (Word *) NULL )
-    return warning("sort/1: first argument is not a proper list");
-  for(n = 0; n < size; n++, array++)
-  { if ( n == 0 || compareStandard(array[-1], array[0]) != 0 )
-      APPENDLIST(sorted, *array);
+  if ( !(array=list_to_sorted_array(list, &size)) )
+    fail;
+  for(n = 0; n < size; n++)
+  { if ( n == 0 || !pl_equal(array+n-1, array+n) )
+    { if ( !PL_unify_list(l, h, l) ||
+	   !PL_unify(h, array+n) )
+	fail;
+    }
   }
-  CLOSELIST(sorted);
-  
-  succeed;
+
+  return PL_unify_nil(l);
 }

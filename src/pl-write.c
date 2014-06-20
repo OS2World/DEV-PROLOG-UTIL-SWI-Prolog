@@ -1,449 +1,715 @@
-/*  pl-write.c,v 1.3 1993/02/23 13:16:51 jan Exp
+/*  $Id: pl-write.c,v 1.47 2001/05/04 10:16:36 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: write/1 and display/1 definition
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
+#include <math.h>
 #include "pl-incl.h"
 #include "pl-ctype.h"
-extern int Output;
+#include <stdio.h>			/* sprintf() */
 
-forwards char *	varName P((Word));
-forwards void	writePrimitive P((Word, bool));
-forwards bool	display P((Word, bool));
-forwards int	priorityOperator P((Atom));
-forwards bool	writeTerm P((Word, int, bool, Word));
-forwards word	displayStream P((Word, Word, bool));
-forwards word	writeStreamTerm P((Word, Word, int, int, Word));
+typedef struct
+{ int   flags;				/* PL_WRT_* flags */
+  int   max_depth;			/* depth limit */
+  int   depth;				/* current depth */
+  Module module;			/* Module for operators */
+  IOSTREAM *out;			/* stream to write to */
+} write_options;
 
-static char *
-varName(adr)
-Word adr;
-{ static char name[10];
+static bool	writeTerm2(term_t term, int prec, write_options *options);
+
+char *
+varName(term_t t, char *name)
+{ Word adr = valTermRef(t);
+
+  deRef(adr);
 
   if (adr > (Word) lBase)
-    sprintf(name, "L%ld", adr - (Word)lBase);
+    Ssprintf(name, "_L%ld", (Word)adr - (Word)lBase);
   else
-    sprintf(name, "G%ld", adr - (Word)gBase);
+    Ssprintf(name, "_G%ld", (Word)adr - (Word)gBase);
 
   return name;
 }
 
-static void
-writePrimitive(w, quote)
-Word w;
-bool quote;
-{ char *s, c;
 
-  DEBUG(9, printf("writing primitive at 0x%x: 0x%x\n", w, *w));
+#define AT_LOWER	0
+#define AT_QUOTE	1
+#define AT_FULLSTOP	2
+#define AT_SYMBOL	3
+#define AT_SOLO		4
+#define AT_SPECIAL	5
 
-  if (isInteger(*w))
-  { Putf("%ld", valNum(*w));
-    return;
+static int
+atomType(atom_t a)
+{ Atom atom = atomValue(a);
+  char *s = atom->name;
+  int len = atom->length;
+
+  if ( len == 0 )
+    return AT_QUOTE;
+
+  if ( isLower(*s) )
+  { for(++s; --len > 0 && isAlpha(*s); s++)
+      ;
+    return len == 0 ? AT_LOWER : AT_QUOTE;
   }
 
-  if (isReal(*w))
-  { Putf("%f", valReal(*w));
-    return;
+  if ( a == ATOM_dot )
+    return AT_FULLSTOP;
+  
+  if ( isSymbol(*s) )
+  { for(++s; --len > 0 && isSymbol(*s); s++)
+      ;
+    return len == 0 ? AT_SYMBOL : AT_QUOTE;
+  }
+
+					/* % should be quoted! */
+  if ( len == 1 && *s != '%' )
+  { if ( isSolo(*s) )
+      return AT_SOLO;
+    switch( *s )
+    { /*case ',':*/
+      case '|':
+	return AT_SOLO;
+    }
+  }
+
+  if ( a == ATOM_nil || a == ATOM_curl )
+    return AT_SPECIAL;
+  
+  return AT_QUOTE;
+}
+
+
+		 /*******************************
+		 *	 PRIMITIVE WRITES	*
+		 *******************************/
+
+static bool
+Putc(int c, IOSTREAM *s)
+{ return Sputc(c, s) == EOF ? FALSE : TRUE;
+}
+
+
+static bool
+PutString(const char *str, IOSTREAM *s)
+{ return Sfputs(str, s) == EOF ? FALSE : TRUE;
+}
+
+
+static bool
+PutStringN(const char *str, unsigned int length, IOSTREAM *s)
+{ int len = (int)length;
+
+  return Sfwrite(str, 1, len, s) == len ? TRUE : FALSE;
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+PutOpenToken() inserts a space in the output stream if the last-written
+and given character require a space to ensure a token-break.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static bool
+PutOpenToken(int c, IOSTREAM *s)
+{ if ( c == EOF )
+  { s->lastc = EOF;
+    return TRUE;
+  } else if ( s->lastc != EOF &&
+	      ((isAlpha(s->lastc) && isAlpha(c)) ||
+	       (isSymbol(s->lastc) && isSymbol(c)) ||
+	       (s->lastc != '(' && !isBlank(s->lastc) && c == '(')) )
+  { return Putc(' ', s);
+  }
+
+  return TRUE;
+}
+
+
+static bool
+PutToken(const char *s, IOSTREAM *stream)
+{ if ( s[0] )
+    return PutOpenToken(s[0], stream) && PutString(s, stream);
+
+  return TRUE;
+}
+
+
+static bool
+PutTokenN(const char *s, unsigned int len, IOSTREAM *stream)
+{ if ( s[0] )
+    return PutOpenToken(s[0], stream) && PutStringN(s, len, stream);
+
+  return TRUE;
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+PutOpenBrace()/PutCloseBrace() are used to put  additional braces around
+a term to avoid an operator  precedence   problem.  If  the last emitted
+character  is  alphanumerical,  there  should  be  a  space  before  the
+openbrace to avoid interpretation as a term.   E.g. not (a,b) instead of
+not(a,b).  Reported by Stefan.Mueller@dfki.de.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static bool
+PutOpenBrace(IOSTREAM *s)
+{ return PutOpenToken('(', s) && Putc('(', s);
+}
+
+
+static bool
+PutCloseBrace(IOSTREAM *s)
+{ return Putc(')', s);
+}
+
+
+static bool
+writeQuoted(IOSTREAM *stream, const char *text, int len, int quote,
+	    write_options *options)
+{ const unsigned char *s = (const unsigned char *)text;
+
+  TRY(Putc(quote, stream));
+
+  while(len-- > 0)
+  { int c = *s++;
+
+    if ( true(options, PL_WRT_CHARESCAPES) )
+    { if ( !isControl(c) && c != quote && c != '\\' )
+      { TRY(Putc(c, stream));
+      } else
+      { char esc[8];
+
+	esc[1] = EOS;
+
+	if ( c == quote )
+	{ esc[0] = c;
+	} else
+	{ switch(c)
+	  { case 7:
+	      esc[0] = 'a';
+	      break;
+	    case '\b':
+	      esc[0] = 'b';
+	      break;
+	    case '\t':
+	      esc[0] = 't';
+	      break;
+	    case '\n':
+	      esc[0] = 'n';
+	      break;
+	    case 11:
+	      esc[0] = 'v';
+	      break;
+	    case '\r':
+	      esc[0] = 'r';
+	      break;
+	    case '\f':
+	      esc[0] = 'f';
+	      break;
+	    case '\\':
+	      esc[0] = '\\';
+	      break;
+	    default:
+	      Ssprintf(esc, "%03o\\", c);
+	  }
+	}
+	if ( !Putc('\\', stream) ||
+	     !PutString(esc, stream) )
+	  fail;
+      }
+    } else
+    { if ( c == quote )
+      { TRY(Putc(c, stream) && Putc(c, stream));
+      } else
+      { TRY(Putc(c, stream));
+      }
+    }
+  }
+
+  return Putc(quote, stream);
+}
+
+
+static bool
+writeAtom(atom_t a, write_options *options)
+{ Atom atom = atomValue(a);
+
+  if ( true(options, PL_WRT_QUOTED) )
+  { switch( atomType(a) )
+    { case AT_LOWER:
+      case AT_SYMBOL:
+      case AT_SOLO:
+      case AT_SPECIAL:
+	return PutToken(atom->name, options->out);
+      case AT_QUOTE:
+      case AT_FULLSTOP:
+      default:
+	return writeQuoted(options->out,
+			   atom->name,
+			   atom->length,
+			   '\'', options);
+    }
+  } else
+    return PutTokenN(atom->name, atom->length, options->out);
+}
+
+
+#if !defined(HAVE_ISNAN) && defined(NaN)
+#define isnan(f)  ((f) == NaN)
+#define HAVE_ISNAN
+#endif
+
+static bool
+writePrimitive(term_t t, write_options *options)
+{ double f;
+  char *s;
+  atom_t a;
+  unsigned int n;
+  char buf[16];
+  IOSTREAM *out = options->out;
+
+  if ( PL_is_variable(t) )
+    return PutToken(varName(t, buf), out);
+
+  if ( PL_get_atom(t, &a) )
+    return writeAtom(a, options);
+
+  if ( PL_is_integer(t) )		/* beware of automatic conversion */
+  { long i;
+    char buf[32];
+
+    PL_get_long(t, &i);
+    sprintf(buf, "%ld", i);
+    return PutToken(buf, out);
+  }
+
+  if ( PL_get_float(t, &f) )
+  { char *s = NULL;
+
+#ifdef HUGE_VAL
+    if ( f == HUGE_VAL )
+    { s = (true(options, PL_WRT_QUOTED) ? "'$Infinity'" : "Infinity");
+    } else
+#endif
+#ifdef HAVE_ISNAN
+    if ( isnan(f) )
+    { s = (true(options, PL_WRT_QUOTED) ? "'$NaN'" : "NaN");
+    }
+#endif
+
+    if ( s )
+      return PutToken(s, out);
+    else
+    { char buf[100];
+
+      sprintf(buf, LD->float_format, f);
+      return PutToken(buf, out);
+    }
+
+    succeed;
   }
 
 #if O_STRING
-  if ( isString(*w) )
-  { s = valString(*w);
-    if ( quote == TRUE )
-    { Put('\"');
-      while( (c = *s++) != EOS )
-      { if ( c == '"' )
-          Put('"');
-        Put(c);
-      }
-      Put('\"');
-    } else
-    { Putf("%s", s);
-    }
-    return;
+  if ( PL_get_string(t, &s, &n) )
+  { if ( true(options, PL_WRT_QUOTED) )
+      return writeQuoted(out, s, n, '"', options);
+    else
+      return PutString(s, out);
   }
 #endif /* O_STRING */
 
-  if (isVar(*w))
-  { Putf("%s", varName(w) );
-    return;
-  }    
-  if (isAtom(*w))
-  { s = stringAtom(*w);
-    DEBUG(9, printf("Atom(%s)\n", s));
-    if (quote == TRUE)
-    { if (isLower(*s))
-      { char *s2;
+  assert(0);
+  fail;
+}
 
-	for(s2 = s; *s2 && isAlpha(*s2); )
-	  s2++;
-	if (*s2 == EOS)
-	{ Putf("%s", stringAtom(*w) );	/* starts lower, rest alpha */
-	  return;
-	}
-      }
-      if (streq(s, ".") )			/* otherwise might be seen */
-      { Putf("'.'");				/* as a full stop */
-	return;
-      }
-      if (isSymbol(*s))
-      { char *s2;
 
-	for(s2 = s; *s2 && isSymbol(*s2); )
-	  s2++;
-	if (*s2 == EOS)
-	{ Putf("%s", stringAtom(*w) );	/* all symbol */
-	  return;
-	}
-      }
-      if ((isSolo(*s) || *s == ',') && s[1] == EOS)
-      { Putf("%s", stringAtom(*w) );		/* just a solo */
-	return;
-      }
-      if (streq(s, "[]") || streq(s, "{}") )	/* specials */
-      { Putf("%s", s);
-	return;
-      }
-      Put('\'');
-      while( (c = *s++) != EOS )
-	if (c == '\'')
-	  Putf("''");
-	else
-	  Put(c);
-      Put('\'');
-      return;
-    } else
-    { Putf("%s", stringAtom(*w) );
-      return;
-    }
+word
+pl_nl1(term_t stream)
+{ IOSTREAM *s;
+
+  if ( getOutputStream(stream, &s) )
+  { Sputc('\n', s);
+    return streamStatus(s);
   }
+
+  fail;
 }
 
 word
 pl_nl()
-{ return Put('\n');
+{ return pl_nl1(0);
 }
 
-word
-pl_nl1(stream)
-Word stream;
-{ streamOutput(stream, pl_nl());
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Call user:portray/1 if defined.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static bool
+callPortray(term_t arg, write_options *options)
+{ predicate_t portray;
+
+  portray = _PL_predicate("portray", 1, "user", &GD->procedures.portray);
+
+  if ( portray->definition->definition.clauses )
+  { fid_t fid   = PL_open_foreign_frame();
+    IOSTREAM *old = Scurout;
+    int rval;
+
+    Scurout = options->out;
+    rval = PL_call_predicate(NULL, FALSE, portray, arg);
+    Scurout = old;
+
+    PL_discard_foreign_frame(fid);
+
+    return rval;
+  }
+
+  fail;
 }
 
 
 static bool
-display(t, quote)
-Word t;
-bool quote;
-{ int n;
-  int arity;
-  Word arg;
+writeTerm(term_t t, int prec, write_options *options)
+{ int rval;
+  int levelSave = options->depth;
+  term_t save = PL_new_term_refs(0);
 
-  DEBUG(9, printf("display term at 0x%x; ", t));
-  deRef(t);
-  DEBUG(9, printf("after deRef() at 0x%x\n", t));
+  if ( ++options->depth > options->max_depth && options->max_depth )
+    rval = PutString("...", options->out);
+  else
+    rval = writeTerm2(t, prec, options);
 
-  if (isPrimitive(*t) )
-  { DEBUG(9, printf("primitive\n"));
-    writePrimitive(t, quote);
-    succeed;
-  }
-
-  arity = functorTerm(*t)->arity;
-  arg = argTermP(*t, 0);
-  DEBUG(9, printf("Complex; arg0 at 0x%x, arity = %d\n", arg, arity));
-
-  DEBUG(9, printf("functorTerm() = 0x%x, ->name = 0x%x\n",
-				functorTerm(*t), functorTerm(*t)->name));
-  writePrimitive((Word)&(functorTerm(*t)->name), quote);
-  Putf("(");
-  for(n=0; n<arity; n++, arg++)
-  { if (n > 0)
-      Putf(", ");
-    display(arg, quote);
-  }
-  Putf(")");
-
-  succeed;
-}
-
-word
-pl_display(term)
-Word term;
-{ return display(term, FALSE);
-}
-
-word
-pl_displayq(term)
-Word term;
-{ return display(term, TRUE);
-}
-
-static word
-displayStream(stream, term, quote)
-Word stream, term;
-bool quote;
-{ streamOutput(stream, display(term, quote));
-}
-
-word
-pl_display2(stream, term)
-Word stream, term;
-{ return displayStream(stream, term, FALSE);
-}
-
-word
-pl_displayq2(stream, term)
-Word stream, term;
-{ return displayStream(stream, term, TRUE);
-}
-
-static int
-priorityOperator(atom)
-Atom atom;
-{ int type, priority;
-  int result = 0;
-
-  if (isPrefixOperator(atom, &type, &priority) && priority > result)
-    result = priority;
-  if (isPostfixOperator(atom, &type, &priority) && priority > result)
-    result = priority;
-  if (isInfixOperator(atom, &type, &priority) && priority > result)
-    result = priority;
-
-  return result;
-}
-
-/*  write a term. The 'enviroment' precedence is prec. 'style' askes
-    for plain writing (write/1), quoting (writeq/1) or portray (print/1)
-
- ** Sun Apr 17 12:48:09 1988  jan@swivax.UUCP (Jan Wielemaker)  */
-
-#define PLAIN		0
-#define QUOTE_ATOMS	1
-#define PORTRAY		2
-
-/*  Call Prolog predicate $portray/1 on 'term'. Succeed or fail
-    according to the result.
-
- ** Sun Jun  5 15:37:12 1988  jan@swivax.UUCP (Jan Wielemaker)  */
-
-static bool
-pl_call2(goal, arg)
-Word goal;
-Word arg;
-{ Module mod = NULL;
-  Atom name;
-  int arity;
-  word g;
-  mark m;
-  int n;
-  bool rval;
-
-  TRY(goal = stripModule(goal, &mod));
-  deRef(goal);
-
-  if ( isAtom(*goal) )
-  { name = (Atom) *goal;
-    arity = 0;
-  } else if ( isTerm(*goal) )
-  { name = functorTerm(*goal)->name;
-    arity = functorTerm(*goal)->arity;
-  } else
-    return warning("call/2: instantiation fault");
-  
-  Mark(m);
-  g = globalFunctor(lookupFunctorDef(name, arity+1));
-  for(n = 0; n < arity; n++)
-    pl_unify(argTermP(g, n), argTermP(goal, n));
-  pl_unify(argTermP(g, n), arg);
-  debugstatus.suspendTrace++;
-  rval = callGoal(mod, g, FALSE);
-  debugstatus.suspendTrace--;
-  Undo(m);
+  options->depth = levelSave;
+  PL_reset_term_refs(save);
 
   return rval;
 }
 
 
 static bool
-writeTerm(term, prec, style, g)
-Word term;
-int prec;
-bool style;
-Word g;
-{ Atom functor;
+writeTerm2(term_t t, int prec, write_options *options)
+{ atom_t functor;
   int arity, n;
   int op_type, op_pri;
-  Word arg;
-  bool quote = (style != PLAIN);
+  atom_t a;
+  IOSTREAM *out = options->out;
 
-  deRef(term);
-
-  if ( !isVar(*term) && style == PORTRAY && pl_call2(g, term) )
+  if ( !PL_is_variable(t) &&
+       true(options, PL_WRT_PORTRAY) &&
+       callPortray(t, options) )
     succeed;
 
-  if (isPrimitive(*term) )
-  { if (isAtom(*term) && priorityOperator((Atom)*term) > prec)
-    { Put('(');
-      writePrimitive(term, quote);
-      Put(')');
+  if ( PL_get_atom(t, &a) )
+  { if ( priorityOperator(NULL, a) > prec )
+    { if ( PutOpenBrace(out) &&
+	   writeAtom(a, options) &&
+	   PutCloseBrace(out) )
+	succeed;
     } else
-      writePrimitive(term, quote);
-
-    succeed;
+      return writeAtom(a, options);
   }
 
-  functor = functorTerm(*term)->name;
-  arity = functorTerm(*term)->arity;
-  arg = argTermP(*term, 0);
+  if ( !PL_get_name_arity(t, &functor, &arity) )
+  { return writePrimitive(t, options);
+  } else
+  { if ( false(options, PL_WRT_IGNOREOPS) )
+    { term_t arg = PL_new_term_ref();
 
-  if (arity == 1)
-  { if (functor == ATOM_curl)
-    { Put('{');
-      for(;;)
-      { deRef(arg);
-	if (!isTerm(*arg) || functorTerm(*arg) != FUNCTOR_comma2)
-	  break;
-	writeTerm(argTermP(*arg, 0), 999, style, g);
-	Put(',');
-	arg = argTermP(*arg, 1);
-      }
-      writeTerm(arg, 999, style, g);      
-      Put('}');
-      succeed;
-    }
-    if (isPrefixOperator(functor, &op_type, &op_pri) )
-    { if (op_pri > prec)
-	Put('(');
-      writePrimitive((Word) &functor, quote);
-      Put(' ');
-      writeTerm(arg, op_type == OP_FX ? op_pri-1 : op_pri, style, g);
-      if (op_pri > prec)
-	Put(')');
-      succeed;
-    }
-    if (isPostfixOperator(functor, &op_type, &op_pri) )
-    { if (op_pri > prec)
-	Put('(');
-      writeTerm(arg, op_type == OP_XF ? op_pri-1 : op_pri, style, g);
-      Put(' ');
-      writePrimitive((Word)&functor, quote);
-      if (op_pri > prec)
-	Put(')');
-      succeed;
-    }
-  } else if (arity == 2)
-  { if (functor == ATOM_dot)
-    { Put('[');
-      for(;;)
-      { writeTerm(arg++, 999, style, g);
-	deRef(arg);
-	if (*arg == (word) ATOM_nil)
-	  break;
-	if (!isList(*arg) )
-	{ Put('|');
-	  writeTerm(arg, 999, style, g);
-	  break;
+      if ( arity == 1 )
+      { if ( functor == ATOM_curl )	/* {a,b,c} */
+	{ term_t a = PL_new_term_ref();
+  
+	  PL_get_arg(1, t, arg);
+	  TRY(Putc('{', out));
+	  for(;;)
+	  { if ( !PL_is_functor(arg, FUNCTOR_comma2) )
+	      break;
+	    PL_get_arg(1, arg, a);
+	    TRY(writeTerm(a, 999, options) &&
+		PutString(", ", out));
+	    PL_get_arg(2, arg, arg);
+	  }
+	  TRY(writeTerm(arg, 999, options) &&
+	      Putc('}', out));
+  
+	  succeed;
 	}
-	Put(',');
-	arg = HeadList(arg);
+  
+	if ( functor == ATOM_isovar )	/* $VAR/1 */
+	{ int n;
+  
+	  PL_get_arg(1, t, arg);
+	  if ( PL_get_integer(arg, &n) && n >= 0 )
+	  { int i = n % 26;
+	    int j = n / 26;
+	    char buf[16];
+
+	    if ( j == 0 )
+	    { buf[0] = i+'A';
+	      buf[1] = EOS;
+	    } else
+	    { sprintf(buf, "%c%d", i+'A', j);
+	    }
+
+	    return PutToken(buf, out);
+	  }
+	}
+					  /* op <term> */
+	if ( currentOperator(options->module, functor, OP_PREFIX,
+			     &op_type, &op_pri) )
+	{ term_t arg = PL_new_term_ref();
+  
+	  PL_get_arg(1, t, arg);
+	  if ( op_pri > prec )
+	  { TRY(PutOpenBrace(out));
+	  }
+	  TRY(writeAtom(functor, options));
+	  TRY(writeTerm(arg,
+			op_type == OP_FX ? op_pri-1 : op_pri,
+			options));
+	  if ( op_pri > prec )
+	  { TRY(PutCloseBrace(out));
+	  }
+
+	  succeed;
+	}
+  
+					  /* <term> op */
+	if ( currentOperator(options->module, functor, OP_POSTFIX,
+			     &op_type, &op_pri) )
+	{ term_t arg = PL_new_term_ref();
+  
+	  PL_get_arg(1, t, arg);
+	  if ( op_pri > prec )
+	    TRY(PutOpenBrace(out));
+	  TRY(writeTerm(arg,
+			op_type == OP_XF ? op_pri-1 : op_pri,
+			options));
+	  TRY(writeAtom(functor, options));
+	  if (op_pri > prec)
+	    TRY(PutCloseBrace(out));
+  
+	  succeed;
+	}
+      } else if ( arity == 2 )
+      { if ( functor == ATOM_dot )	/* [...] */
+	{ term_t head = PL_new_term_ref();
+	  term_t l    = PL_copy_term_ref(t);
+  
+	  TRY(Putc('[', out));
+	  for(;;)
+	  { PL_get_list(l, head, l);
+  
+	    TRY(writeTerm(head, 999, options));
+	    if ( PL_get_nil(l) )
+	      break;
+	    if ( ++options->depth >= options->max_depth && options->max_depth )
+	      return PutString("|...]", options->out);
+	    if ( !PL_is_functor(l, FUNCTOR_dot2) )
+	    { TRY(Putc('|', out));
+	      TRY(writeTerm(l, 999, options));
+	      break;
+	    }
+	    TRY(PutString(", ", out));
+	  }
+	  return Putc(']', out);
+	}
+  
+					  /* <term> op <term> */
+	if ( currentOperator(options->module, functor, OP_INFIX,
+			     &op_type, &op_pri) )
+	{ term_t l = PL_new_term_ref();
+	  term_t r = PL_new_term_ref();
+  
+	  PL_get_arg(1, t, l);
+	  PL_get_arg(2, t, r);
+  
+	  if ( op_pri > prec )
+	    TRY(PutOpenBrace(out));
+	  TRY(writeTerm(l, 
+			op_type == OP_XFX || op_type == OP_XFY
+				? op_pri-1 : op_pri, 
+			options));
+	  if ( functor == ATOM_comma )
+	  { TRY(Putc(',', out));
+	  } else
+	  { TRY(writeAtom(functor, options));
+	  }
+	  if ( functor == ATOM_comma )
+	    TRY(Putc(' ', out));
+	  TRY(writeTerm(r, 
+			op_type == OP_XFX || op_type == OP_YFX
+				? op_pri-1 : op_pri, 
+			options));
+	  if ( op_pri > prec )
+	    TRY(PutCloseBrace(out));
+	  succeed;
+	}
       }
-      Put(']');
-      succeed;
     }
-    if (isInfixOperator(functor, &op_type, &op_pri) )
-    { if (op_pri > prec)
-	Put('(');
-      writeTerm(arg++, 
-		op_type == OP_XFX || op_type == OP_XFY ? op_pri-1 : op_pri, 
-		style, g);
-      if (functor != ATOM_comma)
-	Put(' ');
-      writePrimitive((Word)&functor, quote);
-      Put(' ');
-      writeTerm(arg, 
-		op_type == OP_XFX || op_type == OP_YFX ? op_pri-1 : op_pri, 
-		style, g);
-      if (op_pri > prec)
-	Put(')');
-      succeed;
+					/* functor(<args> ...) */
+    { term_t a = PL_new_term_ref();
+
+      TRY(writeAtom(functor, options) &&
+	  Putc('(', out));
+      for(n=0; n<arity; n++)
+      { if (n > 0)
+	  TRY(PutString(", ", out));
+	PL_get_arg(n+1, t, a);
+	TRY(writeTerm(a, 999, options));
+      }
+      return Putc(')', out);
     }
   }
-
-  writePrimitive((Word)&functor, quote);
-  Put('(');
-  for(n=0; n<arity; n++, arg++)
-  { if (n > 0)
-      Putf(", ");
-    writeTerm(arg, 999, style, g);
-  }
-  Put(')');
-
-  succeed;
 }
+
+static const opt_spec write_term_options[] = 
+{ { ATOM_quoted,	    OPT_BOOL },
+  { ATOM_ignore_ops,	    OPT_BOOL },
+  { ATOM_numbervars,        OPT_BOOL },
+  { ATOM_portray,           OPT_BOOL },
+  { ATOM_character_escapes, OPT_BOOL },
+  { ATOM_max_depth,	    OPT_INT  },
+  { ATOM_module,	    OPT_ATOM },
+  { NULL_ATOM,	     	    0 }
+};
 
 word
-pl_write(term)
-Word term;
-{ writeTerm(term, 1200, PLAIN, NULL);
+pl_write_term3(term_t stream, term_t term, term_t opts)
+{ bool quoted     = FALSE;
+  bool ignore_ops = FALSE;
+  bool numbervars = FALSE;
+  bool portray    = FALSE;
+  bool charescape = -1;			/* not set */
+  atom_t mname    = ATOM_user;
+  IOSTREAM *s;
+  write_options options;
 
-  succeed;
+  options.flags	    = 0;
+  options.max_depth = 0;
+  options.depth     = 0;
+
+  if ( !scan_options(opts, 0, ATOM_write_option, write_term_options,
+		     &quoted, &ignore_ops, &numbervars, &portray,
+		     &charescape, &options.max_depth, &mname) )
+    fail;
+
+  if ( !getOutputStream(stream, &s) )
+    fail;
+  
+  options.module = lookupModule(mname);
+  if ( charescape == TRUE ||
+       (charescape == -1 && true(options.module, CHARESCAPE)) )
+    options.flags |= PL_WRT_CHARESCAPES;
+  
+  if ( quoted )     options.flags |= PL_WRT_QUOTED;
+  if ( ignore_ops ) options.flags |= PL_WRT_IGNOREOPS;
+  if ( numbervars ) options.flags |= PL_WRT_NUMBERVARS;
+  if ( portray )    options.flags |= PL_WRT_PORTRAY;
+
+  options.out = s;
+  PutOpenToken(EOF, s);			/* reset this */
+  writeTerm(term, 1200, &options);
+
+  return streamStatus(s);
 }
+
 
 word
-pl_writeq(term)
-Word term;
-{ writeTerm(term, 1200, QUOTE_ATOMS, NULL);
-
-  succeed;
+pl_write_term(term_t term, term_t options)
+{ return pl_write_term3(0, term, options);
 }
 
-word
-pl_print(term)
-Word term;
-{ word g = (word) ATOM_portray;
 
-  writeTerm(term, 1200, PORTRAY, &g);
+int
+PL_write_term(IOSTREAM *s, term_t term, int precedence, int flags)
+{ write_options options;
 
-  succeed;
+  options.flags	    = flags;
+  options.max_depth = 0;
+  options.depth     = 0;
+  options.out	    = s;
+  options.module    = MODULE_user;
+
+  PutOpenToken(EOF, s);			/* reset this */
+  return writeTerm(term, precedence, &options);
 }
 
-word
-pl_dprint(term, g)
-Word term, g;
-{ writeTerm(term, 1200, PORTRAY, g);
-
-  succeed;
-}
 
 static word
-writeStreamTerm(stream, term, prec, style, g)
-Word stream, term, g;
-int prec, style;
-{ streamOutput(stream, writeTerm(term, prec, style, g));
+do_write2(term_t stream, term_t term, int flags)
+{ IOSTREAM *s;
+
+  if ( getOutputStream(stream, &s) )
+  { write_options options;
+
+    options.flags     = flags;
+    options.max_depth = 0;
+    options.depth     = 0;
+    options.out	      = s;
+    options.module    = MODULE_user;
+    if ( options.module && true(options.module, CHARESCAPE) )
+      options.flags |= PL_WRT_CHARESCAPES;
+
+    PutOpenToken(EOF, s);		/* reset this */
+    writeTerm(term, 1200, &options);
+    
+    return streamStatus(s);
+  }
+
+  fail;
+}
+
+
+word
+pl_write2(term_t stream, term_t term)
+{ return do_write2(stream, term, 0);
 }
 
 word
-pl_write2(stream, term)
-Word stream, term;
-{ return writeStreamTerm(stream, term, 1200, PLAIN, NULL);
+pl_writeq2(term_t stream, term_t term)
+{ return do_write2(stream, term, PL_WRT_QUOTED);
 }
 
 word
-pl_writeq2(stream, term)
-Word stream, term;
-{ return writeStreamTerm(stream, term, 1200, QUOTE_ATOMS, NULL);
+pl_print2(term_t stream, term_t term)
+{ return do_write2(stream, term, PL_WRT_QUOTED|PL_WRT_PORTRAY);
 }
 
 word
-pl_print2(stream, term)
-Word stream, term;
-{ word g = (word) ATOM_portray;
-
-  return writeStreamTerm(stream, term, 1200, PORTRAY, &g);
+pl_write_canonical2(term_t stream, term_t term)
+{ return do_write2(stream, term, PL_WRT_QUOTED|PL_WRT_IGNOREOPS);
 }
+
+word
+pl_write(term_t term)
+{ return pl_write2(0, term);
+}
+
+word
+pl_writeq(term_t term)
+{ return pl_writeq2(0, term);
+}
+
+word
+pl_print(term_t term)
+{ return pl_print2(0, term);
+}
+
+word
+pl_write_canonical(term_t term)
+{ return pl_write_canonical2(0, term);
+}
+
+
+
+

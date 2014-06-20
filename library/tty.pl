@@ -1,4 +1,4 @@
-/*  tty.pl,v 1.1.1.1 1992/05/26 11:51:38 jan Exp
+/*  $Id: tty.pl,v 1.3 2001/03/22 10:37:28 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -9,11 +9,8 @@
 :- module(tty,
 	[ tty_clear/0
 	, tty_flash/0
-	, tty_size/2
 	, menu/3
 	]).
-
-:- use_module(library(ctypes), [is_digit/1, to_lower/2]).
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 		           TERMINAL OPERATIONS
@@ -32,13 +29,6 @@ I/O on video displays.  The package consists of three sections:
 The stream  information  on the   terminal related  streams    is  not
 maintained by these predicates.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-%	tty_size(-Width, -Height)
-%	Get the size of the terminal in characters.
-
-tty_size(Width, Height) :-
-	tty_get_capability(co, number, Width),
-	tty_get_capability(li, number, Height).
 
 %	tty_clear/0
 %	Clear the display.
@@ -178,7 +168,7 @@ menu(Title, List, Choice) :-
 
 show_title(Title) :-
 	to_text(Title, T),
-	format('~T~l~T~2l', [home, center(T)]).
+	format('~T~l~T~2l', [clear, center(T)]).
 
 build_menu(List) :-
 	build_menu(List, 1),
@@ -197,7 +187,7 @@ to_text(Text, Text).
 
 get_answer(List, Choice) :-
 	flag('$menu_feedback', _, 0),
-	get_answer(List, "", Choice).
+	get_answer(List, [], Choice).
 
 get_answer(List, Prefix, Choice) :-
 	get_single_char(A),
@@ -207,15 +197,15 @@ get_answer(List, Prefix, Choice) :-
 	;   get_answer(List, NewPrefix, Choice)
 	).
 
-process_answer(127, _, _, "", _, no) :- !,
+process_answer(127, _, _, [], _, no) :- !,
 	feedback('').
 process_answer(D, List, _, _, Choice, yes) :-
-	is_digit(D),
+	code_type(D, digit),
 	name(N, [D]),
 	nth1(N, List, Choice:Name), !,
 	feedback(Name).
-process_answer(N, _, _, "", _, no) :-
-	is_digit(N), !,
+process_answer(N, _, _, [], _, no) :-
+	code_type(D, digit),
 	feedback(''),
 	tty_flash.
 process_answer(C, List, Prefix, NewPrefix, Choice, Ok) :-
@@ -255,8 +245,8 @@ common_prefix([_:Name|T], Sofar, Prefix) :-
 	common_prefix(T, NewSofar, Prefix).
 
 common_prefix_strings([H1|T1], [H2|T2], [H1|R]) :-
-	to_lower(H1, Lower),
-	to_lower(H2, Lower), !,
+	code_type(Lower, to_lower(H1)),
+	code_type(Lower, to_lower(H2)), !,
 	common_prefix_strings(T1, T2, R).
 common_prefix_strings(_, _, []).
 

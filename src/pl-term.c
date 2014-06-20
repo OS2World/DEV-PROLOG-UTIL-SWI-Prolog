@@ -1,10 +1,13 @@
-/*  pl-term.c,v 1.3 1993/02/23 13:16:48 jan Exp
+/*  $Id: pl-term.c,v 1.27 2001/03/23 16:29:04 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Simple terminal handling
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #include "pl-incl.h"
@@ -15,11 +18,14 @@ realise this is not a proper answer to terminal control from Prolog, but
 I  needed  it  some day and at least it is better than doing things like
 shell(clear), coding terminal sequences hard, etc.   One  day  I  should
 write a decent interface to handle the terminal.  Maybe this will be too
-late;  character  terminals  disappear quickly now.  Use PCE if you want
+late;  character terminals  disappear quickly now.  Use XPCE if you want
 windowing!
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-#if unix || EMX
+#ifdef HAVE_TGETENT
+#ifndef NO_SYS_IOCTL_H_WITH_SYS_TERMIOS_H
+#include <sys/ioctl.h>
+#endif
 
 extern int  tgetent();
 extern int  tgetnum();
@@ -33,52 +39,47 @@ extern int  tputs();
 #define STAT_OK		1
 #define STAT_ERROR	2
 
-extern int Output;			/* Current output stream */
+#ifdef TERMCAP_NEEDS_VARS
 char	PC;				/* Term lib variables */
 char   *BC;
 char   *UP;
 short	ospeed;
+#endif
 
 static int	term_initialised;	/* Extracted term info? */
 static char     *string_area_pointer;	/* Current location */
 static Table	capabilities;		/* Terminal capabilities */
-static word	tty_stream;		/* stream on which to do tty */
 
 typedef struct
-{ Atom	type;				/* type of the entry */
-  Atom  name;				/* Name of the value */
+{ atom_t type;				/* type of the entry */
+  atom_t name;				/* Name of the value */
   word  value;				/* Value of the entry */
 } entry, *Entry;
 
-forwards bool	initTerm P((void));
-forwards Entry	lookupEntry P((Atom, Atom));
+forwards bool	initTerm(void);
 
 void
 resetTerm()
 { if ( capabilities == NULL )
-  { capabilities = newHTable(32);
+  { capabilities = newHTable(16);
   } else
-  { Symbol s;
-
-    term_initialised = STAT_START;
-    for_table(s, capabilities)
-      freeHeap(s->value, sizeof(entry));
+  { term_initialised = STAT_START;
+    for_table(capabilities, s,
+	      freeHeap(s->value, sizeof(entry)));
     clearHTable(capabilities);
   }
-
-  tty_stream = (word) ATOM_user_output;
 }
 
 static bool
-initTerm()
+initTerm(void)
 { static char *buf = NULL;
   static char *string_area = NULL;
 
   if ( term_initialised == STAT_START )
-  { char *term;
+  { char term[100];
 
     term_initialised = STAT_ERROR;
-    if ( (term = getenv("TERM")) == NULL )
+    if ( !getenv3("TERM", term, sizeof(term)) )
       return warning("No variable TERM");
 
     if ( buf == NULL )         buf         = allocHeap(MAX_TERMBUF);
@@ -99,12 +100,11 @@ initTerm()
 }
 
 static Entry
-lookupEntry(name, type)
-Atom name, type;
+lookupEntry(atom_t name, atom_t type)
 { Symbol s;
   Entry e;
 
-  if ( (s = lookupHTable(capabilities, name)) == NULL )
+  if ( (s = lookupHTable(capabilities, (void*)name)) == NULL )
   { if ( initTerm() == FALSE )
       return NULL;
 
@@ -117,115 +117,163 @@ Atom name, type;
     { int n;
 
       if ( (n = tgetnum(stringAtom(name))) != -1 )
-        e->value  = consNum(n);
+        e->value  = consInt(n);
     } else if ( type == ATOM_bool )
     { bool b;
     
       if ( (b = tgetflag(stringAtom(name))) != -1 )
-        e->value = (word) (b ? ATOM_on : ATOM_off);
+        e->value = (b ? ATOM_on : ATOM_off);
     } else if ( type == ATOM_string )
     { char *s;
     
       if ( (s = tgetstr(stringAtom(name), &string_area_pointer)) != NULL )
-        e->value  = (word) lookupAtom(s);
+        e->value  = PL_new_atom(s);	/* locked: ok */
     } else
     { warning("tgetent/3: Illegal type");
       freeHeap(e, sizeof(entry));
       return NULL;
     }
 
-    addHTable(capabilities, name, e);
+    addHTable(capabilities, (void *)name, e);
     return e;
   } else
     return (Entry) s->value;
 }
       
 word
-pl_tty_get_capability(name, type, value)
-Word name, type, value;
+pl_tty_get_capability(term_t name, term_t type, term_t value)
 { Entry e;
+  atom_t n, t;
 
-  if ( !isAtom(*name) || !isAtom(*type) )
+  if ( !PL_get_atom(name, &n) || !PL_get_atom(type, &t) )
     return warning("tgetent/3: instantiation fault");
-  if ( (e = lookupEntry((Atom) *name, (Atom) *type)) == NULL )
+  if ( !(e = lookupEntry(n, t)) )
     fail;
 
   if ( e->value != 0L )
-    return unifyAtomic(value, e->value);
+    return _PL_unify_atomic(value, e->value);
 
   fail;
 }
   
+
+static int
+tputc(int chr)
+{ return Sputc(chr, Suser_output); 
+}
+
+
 word
-pl_tty_goto(x, y)
-Word x, y;
+pl_tty_goto(term_t x, term_t y)
 { Entry e;
   char *s;
+  int ix, iy;
 
-  if ( !isInteger(*x) || !isInteger(*y) )
+  if ( !PL_get_integer(x, &ix) ||
+       !PL_get_integer(y, &iy) )
     return warning("tty_goto: instantiation fault");
 
   if ( (e = lookupEntry(ATOM_cm, ATOM_string)) == NULL ||
         e->value == 0L )
     fail;
 
-  s = tgoto(stringAtom(e->value), (int)valNum(*x), (int)valNum(*y));
+  s = tgoto(stringAtom(e->value), ix, iy);
   if ( streq(s, "OOPS") )
     fail;
-  streamOutput(&tty_stream, (tputs(s, 1, put_character), TRUE));
-}
 
-word
-pl_tty_put(a, affcnt)
-Word a;
-Word affcnt;
-{ char *s = primitiveToString(*a, FALSE);
-
-  if ( s == NULL || !isInteger(*affcnt) )
-    return warning("tty_put: instantiation fault");
-  streamOutput(&tty_stream, (tputs(s, (int)valNum(*affcnt), put_character), TRUE));
-}
-
-word
-pl_set_tty(old, new)
-Word old, new;
-{ TRY( unifyAtomic(old, tty_stream) );
-  if ( streamNo(new, F_WRITE) < 0 )
-    fail;
-
-  tty_stream = *new;
+  tputs(s, 1, tputc);
   succeed;
 }
 
-#else /* ~unix */
+word
+pl_tty_put(term_t a, term_t affcnt)
+{ char *s;
+  int n;
+
+  if ( PL_get_chars(a, &s, CVT_ALL) &&
+       PL_get_integer(affcnt, &n) )
+  { tputs(s, n, tputc);
+    succeed;
+  }
+
+  return warning("tty_put: instantiation fault");
+}
+
+
+word
+pl_tty_size(term_t r, term_t c)
+{ int rows, cols;
+
+#ifdef __unix__
+  int iorval;
+
+#ifdef TIOCGSIZE
+  struct ttysize ws;
+  iorval = ioctl(0, TIOCGSIZE, &ws);
+	
+  rows = ws.ts_lines;
+  cols = ws.ts_cols;
+#else
+#ifdef TIOCGWINSZ
+  struct winsize ws;
+  iorval = ioctl(0, TIOCGWINSZ, &ws);
+
+  rows = ws.ws_row;
+  cols = ws.ws_col;
+#else
+  Entry er, ec;
+
+  if ( (er=lookupEntry(ATOM_li, ATOM_number)) &&
+       (ec=lookupEntry(ATOM_co, ATOM_number)) &&
+       er->value && ec->value )
+  { rows = valInt(er->value);
+    cols = valInt(ec->value);
+    iorval = 0;
+  } else
+    iorval = -1;
+#endif
+#endif
+
+  if ( iorval != 0 )
+    return PL_error("tty_size", 2, MSG_ERRNO, ERR_SYSCALL, ATOM_ioctl);
+#else /*__unix__*/
+  rows = ScreenRows();			/* old stuff refering to plterm.dll */
+  cols = ScreenCols();			/* not used anyway */
+#endif /*__unix__*/
+
+  return PL_unify_integer(r, rows) &&
+	 PL_unify_integer(c, cols);
+}
+
+#else /* ~TGETENT */
 
 void resetTerm()
 {
 }
 
 word
-pl_tty_get_capability(name, type, value)
-Word name, type, value;
+pl_tty_get_capability(term_t name, term_t type, term_t value)
 { return notImplemented("tty_get_capability", 3);
 }
 
 word
-pl_tty_goto(x, y)
-Word x, y;
+pl_tty_goto(term_t x, term_t y)
 { return notImplemented("tty_goto", 2);
 }
 
 word
-pl_tty_put(a, affcnt)
-Word a;
-Word affcnt;
+pl_tty_put(term_t a, term_t affcnt)
 { return notImplemented("tty_put", 2);
 }
 
 word
-pl_set_tty(old, new)
-Word old, new;
+pl_set_tty(term_t old, term_t new)
 { return notImplemented("set_tty", 2);
 }
 
-#endif /* unix */
+word
+pl_tty_size(term_t r, term_t c)
+{ return notImplemented("tty_size", 2);
+}
+
+#endif /* TGETENT */

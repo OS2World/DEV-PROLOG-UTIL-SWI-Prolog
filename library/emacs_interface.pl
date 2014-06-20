@@ -1,4 +1,4 @@
-/*  emacs_interface.pl,v 1.2 1992/10/25 16:31:22 jan Exp
+/*  $Id: emacs_interface.pl,v 1.8 1999/12/13 13:22:24 jan Exp $
 
     Copyright (c) 1991 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -16,6 +16,7 @@
 	  , emacs_next_command/0
 	  , call_emacs/1
 	  , call_emacs/2
+	  , running_under_emacs_interface/0
 	  ]).
 
 
@@ -27,11 +28,11 @@ running_under_emacs_interface :-
 	emacs_tmp_file(_).
 
 emacs_tmp_file(File) :-
-	'$argv'(Argv),
+	current_prolog_flag(argv, Argv),
 	tmp_file(Argv, File).
 
 tmp_file(['+C', Raw|_], File) :- !,
-	concat('Emacs:', File, Raw).
+	atom_concat('Emacs:', File, Raw).
 tmp_file([_|T], File) :-
 	tmp_file(T, File).
 
@@ -61,28 +62,21 @@ tmp_file([_|T], File) :-
 %	problem with path-names: `File' is emacs notion of the absolute
 %	filename.  SWI-Prologs notion may be different due to symbolic
 %	links.  Finally: the region might be the entire file, in which
-%	case we need to know about the module info ...
+%	case we need to know about the module info ...`
+%
+%	(MA)   
+%	For the time being:
+%	"buffer" loads the entire file associated with the buffer.
+%	"predicate" and "region" load the tmp-file. Yes, module info is
+%	scrambled...      
+   
 
-'$editor_load_code'(_buffer, File) :- !,
-	format('Kind = ~w; File = ~w~n', [buffer, File]),
-	emacs_tmp_file(TmpFile),
-	concat('ls -l ', TmpFile, Cmd),
-	shell(Cmd).
-'$editor_load_code'(_Kind, File) :-
-	trace,
-	emacs_tmp_file(TmpFile),
-	'$load_context_module'(File, Module),
-	'$set_source_module'(OldModule, Module),
-	'$start_consult'(File),
-	'$style_check'(OldStyle, OldStyle),
-	seeing(Old), see(TmpFile),
-	repeat,
-	    '$read_clause'(Clause),
-	    '$consult_clause'(Clause, File), !,
-	seen, see(Old),
-	'$style_check'(_, OldStyle),
-	'$set_source_module'(_, OldModule).
 
+'$editor_load_code'(buffer, File) :- !,
+	consult(File).
+'$editor_load_code'(_Kind, _File) :-
+	emacs_tmp_file(TmpFile),
+	consult(TmpFile).
 
 		/********************************
 		*    TELL EMACS ABOUT ERRORS	*
@@ -91,11 +85,11 @@ tmp_file([_|T], File) :-
 %	Redefine [] to clear the compilation-buffer first
 
 :- (   running_under_emacs_interface
-   ->  user:abolish('.', 2),
-       user:abolish(make, 0),
+   ->  user:redefine_system_predicate([_|_]),
+       user:redefine_system_predicate(make),
        user:(module_transparent '.'/2),
        user:assert(([H|T] :- emacs_consult([H|T]))),
-       user:assert((make :- emacs_interface:make)),
+       user:assert((make :- emacs_interface:emacs_make)),
        user:assert(exception(A,B,C) :- emacs_interface:exception(A,B,C))
    ;   true
    ).
@@ -113,7 +107,7 @@ emacs_consult(Files) :-
 	emacs_finish_compilation.
 
 
-make :-
+emacs_make :-
 	emacs_start_compilation,
 	system:make,
 	emacs_finish_compilation.
@@ -127,10 +121,9 @@ exception(warning, warning(Path, Line, Message), _) :-
 
 
 emacs_start_compilation :-
-	absolute_file_name('', Pwd),
-	concat(Cwd, /, Pwd),
+	absolute_file_name('', Pwd),	
 	asserta(compilation_base_dir(Pwd)),
-	call_emacs('(prolog-compilation-start "~w")', [Cwd]).
+	call_emacs('(prolog-compilation-start "~w")', [Pwd]).
 
 	
 emacs_finish_compilation :-
@@ -142,7 +135,7 @@ emacs_warning_file(user, _) :- !,
 	fail.					  % donot give warnings here
 emacs_warning_file(Path, File) :-
 	compilation_base_dir(Cwd),
-	concat(Cwd, File, Path), !.
+	atom_concat(Cwd, File, Path), !.
 emacs_warning_file(Path, Path).
 	
 
@@ -159,12 +152,24 @@ find_predicate1(Name, Arity) :-
 	(   Preds == []
 	->  call_emacs('(@find "undefined" "nodebug")')
 	;   forall(member(Head, Preds),
-		   (source_file(Head, File),
-		    call_emacs('(@fd-in "\"~w\" ~w ~w")', [Name, Arity, File])
+		   ( source_file(Head, File1)
+		   , remove_double_slashes(File1, File)
+		   , call_emacs('(@fd-in "\"~w\" ~w ~w")', [Name, Arity, File])
 		   ))
 	->  call_emacs('(@find "ok" "nodebug")')
 	;   call_emacs('(@find "none" "nodebug")')
 	).
+
+remove_double_slashes(Atom, Atom1) :-
+	name(Atom, L),
+	remove_double_slashes_list(L, L1),
+	name(Atom1, L1).
+
+remove_double_slashes_list([], []).
+remove_double_slashes_list([0'/, 0'/|T], L) :- !,
+	remove_double_slashes_list([0'/|T], L).
+remove_double_slashes_list([H|T], [H|T1]) :-
+	remove_double_slashes_list(T, T1).
 	
 
 find_predicate(Name, Arity, Preds) :-
@@ -256,5 +261,5 @@ call_emacs(Fmt) :-
 call_emacs(Fmt, Args) :-
 	concat_atom(['', Fmt, ''], F1),
 	format(F1, Args),
-	flush.
+	flush_output.
 

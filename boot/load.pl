@@ -4,20 +4,17 @@
     Date:    Jul 29 1990
 */
 
-:-	[ '$BOOT/syspred'
-	, '$BOOT/toplevel'
-	, '$BOOT/listing'
-	, '$BOOT/edit'
-	, '$BOOT/sort'
-	, '$BOOT/bags'
-	, '$BOOT/apply'
-	, '$BOOT/list'
-	, '$BOOT/writef'
-	, '$BOOT/history'
-	, '$BOOT/portray'
-	, '$BOOT/profile'
-	, '$BOOT/dwim'
-	, '$BOOT/foreign'
-	, '$BOOT/parms'
-	, '$BOOT/autoload'
-	].
+:- [ syspred,messages, toplevel
+   , make
+   , sort
+   , bags
+   , apply
+   , list
+   , writef
+   , history
+   , dwim
+   , parms
+   , autoload
+   , qlf, rc , user:topvars
+   ].
+

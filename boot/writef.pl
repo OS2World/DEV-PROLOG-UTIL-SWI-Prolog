@@ -1,4 +1,4 @@
-/*  writef.pl,v 1.1.1.1 1992/05/26 11:51:24 jan Exp
+/*  $Id: writef.pl,v 1.5 2000/08/09 10:20:22 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -78,7 +78,7 @@ $writefs([Char|Rest], List) :-		%   <ordinary character>
 $action(0't, [Head|Tail], Tail) :-	%   Term
 	print(Head).
 $action(0'd, [Head|Tail], Tail) :-	%   Display
-	display(Head).
+	write_canonical(Head).
 $action(0'w, [Head|Tail], Tail) :-	%   Write
 	write(Head).
 $action(0'q, [Head|Tail], Tail) :-	%   Quoted
@@ -108,7 +108,7 @@ $getcode(Char, In, Out) :-
 
 $getdigits(Limit, [Digit|Digits], In, Out) :-
 	Limit > 0,
-	$char(In, Digit, Out0),
+	'C'(In, Digit, Out0),
 	between(0'0, 0'9, Digit),
 	Fewer is Limit - 1, !,
 	$getdigits(Fewer, Digits, Out0, Out).
@@ -130,7 +130,7 @@ $writelots(_, _).
 $getpad(Size, Just, In, Out) :-
 	$getdigits(3, Digits, In, Out0),
 	name(Size, Digits),
-	$char(Out0, Out1, Out),
+	'C'(Out0, Out1, Out),
 	$getpad(Out1, Just).
 
 $getpad(0'r, r).		%  right justified
@@ -165,6 +165,7 @@ $string([H|T]) :-
 $print(10).			% newline
 $print(9).			% tab
 $print(X) :-
+	integer(X),
 	between(32, 0'~, X).
 
 
@@ -178,7 +179,7 @@ $padout(l, Size, Length, 0, Right) :- !,
 $padout(r, Size, Length, Left, 0) :- !,
 	Left is max(1, Size-Length).
 $padout(c, Size, Length, Left, Right) :-
-	Left is max(1, (Size - Length)/2),
+	Left is max(1, round((Size - Length)/2)),
 	Right is max(1, Size - Length - Left).
 
 				%   $padout(Str) writes a string.

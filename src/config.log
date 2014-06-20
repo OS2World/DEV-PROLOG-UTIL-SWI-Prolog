@@ -1,0 +1,162 @@
+This file contains any messages produced by compilers while
+running configure, to aid debugging if configure makes a mistake.
+
+configure:585: checking builddir
+configure:600: checking for gcc
+configure:713: checking whether the C compiler (gcc  ) works
+configure:729: gcc -o conftest    conftest.c  1>&5
+configure:755: checking whether the C compiler (gcc  ) is a cross-compiler
+configure:760: checking whether we are using GNU C
+configure:788: checking whether gcc accepts -g
+configure:823: checking for ranlib
+configure:876: checking host system type
+configure:965: checking for make
+configure:996: checking whether make is GNU-make
+configure:1007: checking whether mkdir accepts -p
+configure:1021: checking for ar
+configure:1053: checking for etags
+configure:1088: checking for mawk
+configure:1129: checking for a BSD compatible install
+configure:1185: checking how to run the C preprocessor
+configure:1269: checking for POSIXized ISC
+configure:1290: checking for ANSI C header files
+configure:1446: checking for inline
+configure:1488: checking for working alloca.h
+configure:1521: checking for alloca
+configure:1720: checking whether byte ordering is bigendian
+configure:2232: checking for main in -lm
+configure:2275: checking for main in -lncurses
+configure:2319: checking for main in -lcurses
+configure:2365: checking for main in -ltermcap
+configure:2487: checking for main in -lreadline
+configure:2531: checking for main in -lncurses
+configure:2575: checking for main in -lcurses
+configure:2671: checking for readline/readline.h
+configure:2714: checking for readline/readline.h
+configure:2724: gcc -E  conftest.c >/dev/null 2>conftest.out
+configure:2720:31: readline/readline.h: No such file or directory
+configure: failed program was:
+#line 2719 "configure"
+#include "confdefs.h"
+#include <readline/readline.h>
+configure:2995: checking for dlfcn.h
+configure:3032: checking for dlopen in -ldl
+configure:3082: checking for dlopen
+configure:3282: checking for cc -c -o
+configure:3301: checking for unistd.h
+configure:3301: checking for string.h
+configure:3301: checking for memory.h
+configure:3301: checking for sys/time.h
+configure:3301: checking for sys/stat.h
+configure:3301: checking for pwd.h
+configure:3341: checking for sys/select.h
+configure:3341: checking for sys/param.h
+configure:3341: checking for sys/file.h
+configure:3341: checking for sys/resource.h
+configure:3381: checking for malloc.h
+configure:3381: checking for sys/malloc.h
+configure:3421: checking for sys/termios.h
+configure:3421: checking for sys/termio.h
+configure:3421: checking for bstring.h
+configure:3421: checking for sys/mman.h
+configure:3461: checking for mach-o/rld.h
+configure:3461: checking for locale.h
+configure:3501: checking for access
+configure:3501: checking for fchmod
+configure:3501: checking for chmod
+configure:3501: checking for dossleep
+configure:3501: checking for fstat
+configure:3501: checking for readlink
+configure:3501: checking for getwd
+configure:3501: checking for getcwd
+configure:3556: checking for getpagesize
+configure:3556: checking for getpwnam
+configure:3556: checking for getrlimit
+configure:3556: checking for gettimeofday
+configure:3556: checking for opendir
+configure:3556: checking for sysconf
+configure:3611: checking for popen
+configure:3611: checking for putenv
+configure:3611: checking for random
+configure:3611: checking for remove
+configure:3611: checking for rename
+configure:3611: checking for select
+configure:3666: checking for signal
+configure:3666: checking for sigset
+configure:3666: checking for sigprocmask
+configure:3666: checking for sleep
+configure:3666: checking for usleep
+configure:3666: checking for srand
+configure:3666: checking for srandom
+configure:3666: checking for stat
+configure:3721: checking for memmove
+configure:3721: checking for stricmp
+configure:3721: checking for strlwr
+configure:3721: checking for sigaction
+configure:3721: checking for sigsetmask
+configure:3721: checking for siggetmask
+configure:3721: checking for sigblock
+configure:3776: checking for rint
+configure:3776: checking for aint
+configure:3776: checking for floor
+configure:3776: checking for ceil
+configure:3776: checking for isnan
+configure:3776: checking for tcsetattr
+configure:3776: checking for cfmakeraw
+configure:3831: checking for strerror
+configure:3831: checking for tgetent
+configure:3831: checking for times
+configure:3831: checking for unsetenv
+configure:3831: checking for grantpt
+configure:3886: checking for setlocale
+configure:3941: checking for mmap
+configure:3994: checking whether time.h and sys/time.h may both be included
+configure:4033: checking for dirent.h that defines DIR
+configure:4071: checking for opendir in -ldir
+configure:4154: checking for sys/wait.h that is POSIX.1 compatible
+configure:4196: checking for pid_t
+configure:4230: checking for vfork.h
+configure:4265: checking for working vfork
+configure:4440: checking size of long
+configure:4479: checking size of int
+configure:4519: checking Boot filename
+configure:4530: checking Static include of __register_frame_info
+configure:4542: checking alignment restrictions on doubles
+configure:4571: gcc -o conftest -g -O2 -I/usr/local/include   conftest.c -ldl -lm  1>&5
+configure:4589: checking unaligned access
+configure:4614: gcc -o conftest -g -O2 -I/usr/local/include   conftest.c -ldl -lm  1>&5
+configure:4633: checking type rlim_t
+configure:4647: gcc -c -g -O2 -I/usr/local/include  conftest.c 1>&5
+configure:4664: checking whether assert.h needs stdio.h
+configure:4676: gcc -c -g -O2 -I/usr/local/include  conftest.c 1>&5
+configure:4692: checking for including sys/ioctl.h after sys/termios.h
+configure:4711: gcc -c -g -O2 -I/usr/local/include -Werror  conftest.c 1>&5
+configure:4760: checking for type uchar
+configure:4772: gcc -c -g -O2 -I/usr/local/include  conftest.c 1>&5
+configure:4788: checking whether we need extern int errno
+configure:4802: gcc -c -g -O2 -I/usr/local/include  conftest.c 1>&5
+configure:4818: checking for symbolic links
+configure:4830: checking return type of signal handlers
+configure:4871: checking for BSD signal handlers
+configure:4898: gcc -o conftest -g -O2 -I/usr/local/include   conftest.c -ldl -lm  1>&5
+configure:4916: checking for SIGPROF profiler support
+configure:4954: gcc -o conftest -g -O2 -I/usr/local/include   conftest.c -ldl -lm  1>&5
+configure:4972: checking for union wait
+configure:4989: gcc -c -g -O2 -I/usr/local/include -Werror  conftest.c 1>&5
+configure:5006: checking for tagged lvalues
+configure:5019: gcc -c -g -O2 -I/usr/local/include  conftest.c 1>&5
+configure:5035: checking for label addresses
+configure:5062: gcc -c -g -O2 -I/usr/local/include  conftest.c 1>&5
+configure:5084: checking memory model
+conftest.c: In function `sub':
+conftest.c:42: warning: function returns address of local variable
+configure:5101: checking for nop
+configure:5123: checking for siginfo.h
+configure:5161: checking for SA_SIGINFO
+configure:5181: gcc -c -g -O2 -I/usr/local/include  conftest.c 1>&5
+configure:5200: checking if we can use mmap for stack allocation
+conftest.c:25:8: warning: extra tokens at end of #endif directive
+conftest.c:28:8: warning: extra tokens at end of #endif directive
+configure:5221: checking if SA_SIGINFO is usable
+configure:5260: checking whether LDFLAGS need -export-dynamic
+configure:5274: gcc -o conftest -g -O2 -I/usr/local/include  -export-dynamic  conftest.c -ldl -lm  1>&5

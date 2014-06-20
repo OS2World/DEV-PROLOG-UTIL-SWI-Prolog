@@ -1,4 +1,4 @@
-/*  apply.pl,v 1.1.1.1 1992/05/26 11:51:21 jan Exp
+/*  $Id: apply.pl,v 1.3 1998/11/30 15:13:17 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -14,26 +14,37 @@
 
 :- module_transparent
 	checklist/2, 
+	checklist2/2, 
 	maplist/3, 
+	maplist2/3, 
 	sublist/3, 
 	forall/2.
 
 %	checklist(+Goal, +List)
+%
 %	True if Goal can succesfully be applied on all elements of List.
+%	Arguments are reordered to gain performance as well as to make
+%	the predicate deterministic under normal circumstances.
 
-checklist(_, []).
-checklist(Goal, [Elem|Tail]) :-
-	$apply(Goal, [Elem]), 
-	checklist(Goal, Tail).
+checklist(Goal, List) :-
+	checklist2(List, Goal).
+
+checklist2([], _).
+checklist2([Elem|Tail], Goal) :-
+	call(Goal, Elem), 
+	checklist2(Tail, Goal).
 
 %	maplist(+Goal, +List1, ?List2)
 %	True if Goal can succesfully be applied to all succesive pairs
 %	of elements of List1 and List2.
 
-maplist(_, [], []).
-maplist(Goal, [Elem1|Tail1], [Elem2|Tail2]) :-
-	$apply(Goal, [Elem1, Elem2]), 
-	maplist(Goal, Tail1, Tail2).
+maplist(Goal, List1, List2) :-
+	maplist2(List1, List2, Goal).
+
+maplist2([], [], _).
+maplist2([Elem1|Tail1], [Elem2|Tail2], Goal) :-
+	call(Goal, Elem1, Elem2), 
+	maplist2(Tail1, Tail2, Goal).
 
 %	sublist(+Goal, +List1, ?List2)
 %	Succeeds if List2 unifies with a list holding those terms for wich
@@ -41,7 +52,7 @@ maplist(Goal, [Elem1|Tail1], [Elem2|Tail2]) :-
 
 sublist(_, [], []) :- !.
 sublist(Goal, [H|T], Sub) :-
-	$apply(Goal, [H]), !, 
+	call(Goal, H), !, 
 	Sub = [H|R], 
 	sublist(Goal, T, R).
 sublist(Goal, [_|T], R) :-

@@ -1,1 +1,0 @@
-runtime\PC\pl.exe -O -o startup\startup.PC -b boot/init.pl -c boot/syspred.pl boot/toplevel.pl boot/listing.pl boot/edit.pl boot/sort.pl boot/bags.pl boot/apply.pl boot/list.pl boot/writef.pl boot/history.pl boot/portray.pl boot/profile.pl boot/dwim.pl boot/foreign.pl boot/parms.pl boot/autoload.pl 

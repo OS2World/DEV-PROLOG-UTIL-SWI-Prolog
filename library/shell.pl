@@ -9,18 +9,16 @@
 	, (ls)/1
 	, (cd)/0
 	, (cd)/1
-	, (p)/0
-	, (p)/1
-	, d/0
-	, pd/0
+	, (pushd)/0
+	, (pushd)/1
+	, dirs/0
+	, pwd/0
+	, popd/0
 	, mv/2
 	, (rm)/1
-	, (grep)/1
-	, (grep)/2
-	, (tg)/1
 	]).
 
-:- op(900, fy, [ls, cd, p, rm, grep, tg]).
+% :- op(900, fy, [ls, cd, pushd, rm, grep]).
 
 /*  Shell Emulation Library
 
@@ -30,8 +28,6 @@
     allows  shell/[0,1,2]  if  Prolog  uses less than half the amount of
     available memory.  This library offers a number  of  predicates  for
     listing, directory management, deleting, copying and renaming files.
-    It should be combined with the linked-in version of Richard O'Keefes
-    `thief' editor (via the $thief/1 predicate).
 
  ** Sun Sep 17 12:04:54 1989  jan@swi.psy.uva.nl */
 
@@ -46,55 +42,65 @@ cd(Dir) :-
 	name_to_atom(Dir, Name),
 	chdir(Name).
 
-%	d	-- Print Directory Stack
-%	p	-- Push Directory Stack
-%	pd	-- Pop Directory Stack
+%	dirs	-- Print Directory Stack
+%	pushd	-- Push Directory Stack
+%	popd	-- Pop Directory Stack
 
 :- dynamic
 	stack/1.
 
-(p) :-
-	p(+1).
+(pushd) :-
+	pushd(+1).
 
-p(N) :-
+pushd(N) :-
 	integer(N), !,
 	findall(D, stack(D), Ds),
 	(   nth1(N, Ds, Go),
 	    retract(stack(Go))
-	->  p(Go)
-	;   warning('Directory stack not that deep'),
+	->  pushd(Go)
+	;   warning('Directory stack not that deep', []),
 	    fail
 	).
-p(Dir) :-
+pushd(Dir) :-
 	name_to_atom(Dir, Name),
 	absolute_file_name('', Old),
 	chdir(Name),
 	asserta(stack(Old)).
 
-pd :-
+popd :-
 	retract(stack(Dir)), !,
 	chdir(Dir).
-pd :-
-	warning('Directory stack empty'),
+popd :-
+	warning('Directory stack empty', []),
 	fail.
 
-d :-
+dirs :-
 	(   absolute_file_name('', D)
 	;   stack(D)
 	),
 	dir_name(D, Name),
 	format('~w ', [Name]),
 	fail.
-d :-
+dirs :-
 	nl.
+
+pwd :-
+	absolute_file_name('', D),
+	dir_name(D, Name),
+	format('~w~n', [Name]).
 
 dir_name('/', '/') :- !.
 dir_name(Path, Name) :-
-	concat(P, /, Path), !,
+	atom_concat(P, /, Path), !,
 	dir_name(P, Name).
 dir_name(Path, Name) :-
-	absolute_file_name('~', Home),
-	concat(Home, FromHome, Path), !,
+	current_prolog_flag(unix, true),
+	absolute_file_name('~', Home0),
+	(   atom_concat(Home, /, Home0)
+	->  true
+	;   Home = Home0
+	),
+	atom_concat(Home, FromHome, Path), !,
 	sformat(Name, '~~~w', [FromHome]).
 dir_name(Path, Path).
 
@@ -112,25 +118,24 @@ ls(Spec) :-
 
 ls_([Dir]) :-
 	exists_directory(Dir), !,
-	(   Dir == '.'
-	->  expand_file_name('*', Files)
-	;   concat(Dir, '/*', Spec),
-	    expand_file_name(Spec, Files)
-	),
-	ls__(Files).
+	absolute_file_name('', Here),
+	chdir(Dir),
+	expand_file_name('*', Files),
+	ls__(Files),
+	chdir(Here).
 ls_(Files) :-
 	ls__(Files).
 
 ls__([]) :- !,
-	warning('No Match'),
+	warning('No Match', []),
 	fail.
 ls__(Files) :-
 	maplist(tag_file, Files, Tagged),
-	list_atoms(Tagged, 78).
+	list_atoms(Tagged, 72).
 
 tag_file(File, Dir) :-
 	exists_directory(File),	
-	concat(File, /, Dir).
+	atom_concat(File, /, Dir).
 tag_file(File, File).
 
 %	mv(+From, +To)	--- Move (Rename) a file
@@ -144,48 +149,6 @@ mv(From, To) :-
 rm(File) :-
 	name_to_atom(File, A),
 	delete_file(A).
-
-%	grep(String)		--- grep through all source files
-%	grep(File, String)	--- grep through specified files
-
-grep(S) :-
-	flag(grep_, _, 0),
-	source_file(File),
-	    File \== user,
-	    grep_(File, S),
-	fail.
-grep(_) :-
-	flag(grep_, 1, 1).
-
-grep(File, S) :-
-	flag(grep_, _, 0),
-	name_to_atom(File, F),
-	expand_file_name(F, Files),
-	member(F2, Files),
-	    grep_(F2, S),
-	fail.
-grep(_, _) :-
-	flag(grep_, 1, 1).
-
-grep_(File, S) :-
-	'$file_base_name'(File, Base),
-	'$grep'(File, S, Line),
-	    flag(grep_, _, 1),
-	    format('~w: ~w~n', [Base, Line]),
-	fail.
-grep_(_, _) :-
-	flag(grep_, 1, 1).
-
-tg(String) :-
-	source_file(File),
-	    File \== user,
-	    (   '$grep'(File, String, _)
-	    ->  '$confirm'('Edit ~w', [File]),
-		concat('-', String, Search),
-		\+ '$thief'(['-f', File, Search])	% succeed on ^C
-	    ).
-tg(_) :-
-	make.
 
 %	name_to_atom(Typed, Atom)
 %	Convert a typed name into an atom
@@ -217,14 +180,21 @@ list_atoms(List, W) :-
 	Max is Columns * Rows - 1,
 	between(0, Max, N),
 	    Index is N // Columns + (N mod Columns) * Rows + 1,
+	    (	(N+1) mod Columns =:= 0
+	    ->	NL = nl
+	    ;	NL = fail
+	    ),
 	    (	arg(Index, Term, Atom),
 		atom_length(Atom, AL),
-		write(Atom), tab(ColumnWidth - AL)
+		write(Atom),
+		(   NL == fail
+		->  tab(ColumnWidth - AL)
+		;   true
+		)
 	    ->  true
 	    ;   true
 	    ),
-	    (N+1) mod Columns =:= 0,
-	    nl,
+	    NL,
 	fail.
 list_atoms(_, _).
 
@@ -241,8 +211,5 @@ longest([_|T], S, M) :-
 
 %	warning(Fmt, [Args]).
 
-warning(Fmt) :-
-	warning(Fmt, []).
-
 warning(Fmt, Args) :-
-	'$break'('$warning'(Fmt, Args)).
+	print_message(warning, format(Fmt, Args)).

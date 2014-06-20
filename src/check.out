@@ -1,0 +1,9 @@
+Message: redefined_procedure(static, prolog_message/3)
+Message: redefined_procedure(static, prolog_message/3)
+Message: redefined_procedure(static, prolog_message/3)
+Message: redefined_procedure(static, prolog_message/3)
+% Unknown message: load_file(done(0, file('/pl-4.0.9/src/test.pl', 'C:\\pl-4.0.9\\src\\test.pl'), compiled, user, 0.07, 83708))
+SYS1041: The name true is not recognized as an
+internal or external command, operable program or batch file.
+Wrong exception: error(io_error(write, '$stream'(223656)), context(_G207, 'Invalid argument'))
+make: *** [check] Error 1

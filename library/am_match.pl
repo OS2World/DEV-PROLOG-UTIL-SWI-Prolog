@@ -1,4 +1,4 @@
-/*  am_match.pl,v 1.1.1.1 1992/05/26 11:51:32 jan Exp
+/*  $Id: am_match.pl,v 1.2 2000/12/17 11:16:22 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -99,7 +99,7 @@ am_anychar([C|Rest]) -->
 	am_anychar(Rest).	
 
 am_max_string([C|Rest]) -->
-	am_next_char("\"), 
+	am_next_char("\\"), 
 	am_next_char([C]), !, 
 	am_max_string(Rest).
 am_max_string([C|Rest]) -->
@@ -113,7 +113,7 @@ am_any_string([]) -->
 am_any_string([]) -->
 	am_see_char(", "), !.
 am_any_string([C|Rest]) -->
-	am_next_char("\"), 
+	am_next_char("\\"), 
 	am_next_char([C]), !, 
 	am_any_string(Rest).
 am_any_string([C|Rest]) -->

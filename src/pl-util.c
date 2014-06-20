@@ -1,67 +1,26 @@
-/*  pl-util.c,v 1.1.1.1 1992/05/26 11:52:27 jan Exp
+/*  $Id: pl-util.c,v 1.26 2001/03/23 13:20:37 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: asorted handy functions
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #include "pl-incl.h"
 #include "pl-ctype.h"
 
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Transform a Prolog word into an integer.   Accepts  integers  and  reals
-that are by accident integer.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-bool
-wordToInteger(w, n)
-word w;
-long *n;
-{ real f;
-
-  if (isInteger(w) )
-  { *n = valNum(w);
-    succeed;
-  }
-  if (isReal(w) )
-  { f = valReal(w);
-    if (f == (real)((long)f))
-    { *n = (long) f;
-      succeed;
-    }      
-  }
-  fail;
-}  
-
-/*  Transform a Prolog word into a real.  Accepts integers and reals.
-
- ** Fri Jun 10 10:45:18 1988  jan@swivax.UUCP (Jan Wielemaker)  */
-
-bool
-wordToReal(w, f)
-word w;
-real *f;
-{ if (isInteger(w) )
-  { *f = (real) valNum(w);
-    succeed;
-  }
-  if (isReal(w) )
-  { *f = valReal(w);
-    succeed;
-  }
-  fail;
-}  
+static bool	isUserSystemPredicate(Definition def);
 
 /*  Return the character representing some digit.
 
  ** Fri Jun 10 10:45:40 1988  jan@swivax.UUCP (Jan Wielemaker)  */
 
 char
-digitName(n, small)
-int n;
-bool small;
+digitName(int n, bool small)
 { if (n <= 9)
     return n + '0';
   return n + (small ? 'a' : 'A') - 10;
@@ -72,81 +31,245 @@ bool small;
 
  ** Fri Jun 10 10:46:40 1988  jan@swivax.UUCP (Jan Wielemaker)  */
 
-#if PROTO
 int
-digitValue(int b, char c)
-#else
-int
-digitValue(b, c)
-int b;
-char c;
-#endif
-{ DEBUG(9, printf("digitValue(%d, %c)\n", b, c));
-  if (b == 0)
-  { if (c & 0x80)
-      return -1;
-    return c;
-  }
-  if (b == 1)
+digitValue(int b, int c)
+{ int v;
+
+  if ( b == 0 )
+    return c;				/* 0'c */
+  if ( b == 1 )
     return -1;
-  if (b <= 10)
-  { if (c - '0' < b)
-      return c - '0';
+  if ( b <= 10 )
+  { v = c - '0';
+    if ( v < b )
+      return v;
     return -1;
   }
-  if (c <= '9')
+  if ( c <= '9' )
     return c - '0';
   if (isUpper(c))
     c = toLower(c);
   c = c - 'a' + 10;
-  if (c < b)
+  if ( c < b && c >= 10 )
     return c;
   return -1;
 }
 
-/*  return the name of a procedure as a string.  The result is stored in
-    static  area and should be copied away before the next call if it is
-    to be preserved.
 
- ** Sun Aug 28 13:21:07 1988  jan@swivax.UUCP (Jan Wielemaker)  */
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+These  functions  return  a  user-printable  name   of  a  predicate  as
+name/arity or module:name/arity. The result  is   stored  in the foreign
+buffer ring, so we are thread-safe, but   the  result needs to be copied
+before the ring is exhausted. See buffer_string() for details.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 char *
-procedureName(proc)
-Procedure proc;
-{ static char tmp[256];
+procedureName(Procedure proc)
+{ return predicateName(proc->definition);
+}
 
-  if ( proc->definition->module == MODULE_user ||
-       isUserSystemProcedure(proc) )
-    sprintf(tmp, "%s/%d", stringAtom(proc->functor->name), 
-			  proc->functor->arity);
+
+char *
+predicateName(Definition def)
+{ char tmp[256];
+
+  if ( def->module == MODULE_user || isUserSystemPredicate(def) )
+    Ssprintf(tmp, "%s/%d",
+	     stringAtom(def->functor->name), 
+	     def->functor->arity);
   else
-    sprintf(tmp, "%s:%s/%d", stringAtom(proc->definition->module->name), 
-			     stringAtom(proc->functor->name), 
-			     proc->functor->arity);
+    Ssprintf(tmp, "%s:%s/%d",
+	     stringAtom(def->module->name), 
+	     stringAtom(def->functor->name), 
+	     def->functor->arity);
 
-  return tmp;
+  return buffer_string(tmp, BUF_RING);
 }
 
 /*  succeeds if proc is a system predicate exported to the public module.
 
  ** Fri Sep  2 17:03:43 1988  jan@swivax.UUCP (Jan Wielemaker)  */
 
-bool
-isUserSystemProcedure(proc)
-Procedure proc;
-{ if ( true(proc->definition, SYSTEM) &&
-       isCurrentProcedure(proc->functor, MODULE_user) != (Procedure) NULL)
+static bool
+isUserSystemPredicate(Definition def)
+{ if ( true(def, SYSTEM) &&
+       isCurrentProcedure(def->functor->functor, MODULE_user) )
     succeed;
 
   fail;
 }
 
+
 word
-notImplemented(name, arity)
-char *name;
-int arity;
-{ return warning("%s/%d is not implemented in this version");
+notImplemented(char *name, int arity)
+{ return warning("%s/%d is not implemented in this version", name, arity);
 }
+
+
+word
+setBoolean(int *flag, term_t old, term_t new)
+{ if ( !PL_unify_bool_ex(old, *flag) ||
+       !PL_get_bool_ex(new, flag) )
+    fail;
+
+  succeed;
+}
+
+
+word
+setInteger(int *flag, term_t old, term_t new)
+{ if ( !PL_unify_integer(old, *flag) ||
+       !PL_get_integer_ex(new, flag) )
+    fail;
+
+  succeed;
+}
+
+
+word
+setLong(long *flag, term_t old, term_t new)
+{ if ( !PL_unify_integer(old, *flag) ||
+       !PL_get_long_ex(new, flag) )
+    fail;
+
+  succeed;
+}
+
+
+		 /*******************************
+		 *	       OPTIONS		*
+		 *******************************/
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Variable argument list:
+
+	atom_t	name
+	int	type	OPT_ATOM, OPT_STRING, OPT_BOOL, OPT_INT, OPT_LONG
+	pointer	value
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#define MAXOPTIONS 32
+
+typedef union
+{ bool *b;				/* boolean value */
+  long *l;				/* integer value */
+  int  *i;				/* integer value */
+  char **s;				/* string value */
+  word *a;				/* atom value */
+  term_t *t;				/* term-reference */
+  void *ptr;				/* anonymous pointer */
+} optvalue;
+
+bool
+scan_options(term_t options, int flags, atom_t optype,
+	     const opt_spec *specs, ...)
+{ va_list args;
+  const opt_spec *s;
+  optvalue values[MAXOPTIONS];
+  term_t list = PL_copy_term_ref(options);
+  term_t head = PL_new_term_ref();
+  term_t tmp  = PL_new_term_ref();
+  term_t val  = PL_new_term_ref();
+  int n;
+
+  if ( trueFeature(ISO_FEATURE) )
+    flags |= OPT_ALL;
+
+  va_start(args, specs);
+  for( n=0, s = specs; s->name; s++, n++ )
+    values[n].ptr = va_arg(args, void *);
+  va_end(args);
+
+  while ( PL_get_list(list, head, list) )
+  { atom_t name;
+    int arity;
+    
+    if ( PL_get_name_arity(head, &name, &arity) )
+    { if ( name == ATOM_equals && arity == 2 )
+      { PL_get_arg(1, head, tmp);
+
+	if ( !PL_get_atom(tmp, &name) )
+	  goto itemerror;
+	PL_get_arg(2, head, val);
+      } else if ( arity == 1 )
+      { PL_get_arg(1, head, val);
+      } else if ( arity == 0 )
+	PL_put_atom(val, ATOM_true);
+    } else if ( PL_is_variable(head) )
+    { return PL_error(NULL, 0, NULL, ERR_INSTANTIATION);
+    } else
+    { itemerror:
+      return PL_error(NULL, 0, NULL, ERR_DOMAIN, optype, head);
+    }
+
+    for( n=0, s = specs; s->name; n++, s++ )
+    { if ( s->name == name )
+      { switch(s->type)
+	{ case OPT_BOOL:
+	  { atom_t aval;
+
+	    if ( !PL_get_atom(val, &aval) )
+	      fail;
+	    if ( aval == ATOM_true || aval == ATOM_on )
+	      *values[n].b = TRUE;
+	    else if ( aval == ATOM_false || aval == ATOM_off )
+	      *values[n].b = FALSE;
+	    else
+	      goto itemerror;
+	    break;
+	  }
+	  case OPT_INT:
+	  { if ( !PL_get_integer(val, values[n].i) )
+	      goto itemerror;
+
+	    break;
+	  }
+	  case OPT_LONG:
+	  { if ( !PL_get_long(val, values[n].l) )
+	      goto itemerror;
+
+	    break;
+	  }
+	  case OPT_STRING:
+	  { char *str;
+
+	    if ( !PL_get_chars(val, &str, CVT_ALL) ) /* copy? */
+	      goto itemerror;
+	    *values[n].s = str;
+	    break;
+	  }
+	  case OPT_ATOM:
+	  { atom_t a;
+
+	    if ( !PL_get_atom(val, &a) )
+	      goto itemerror;
+	    *values[n].a = a;
+	    break;
+	  }
+	  case OPT_TERM:
+	  { *values[n].t = val;
+	    val = PL_new_term_ref();	/* can't reuse anymore */
+	    break;
+	  }
+	  default:
+	    assert(0);
+	    fail;
+	}
+	break;
+      }
+    }
+    
+    if ( !s->name && (flags & OPT_ALL) )
+      goto itemerror;
+  }
+
+  if ( !PL_get_nil(list) )
+    return PL_error(NULL, 0, NULL, ERR_TYPE, ATOM_list, list);
+  
+  succeed;
+}
+
+
 
 		/********************************
 		*             STRING            *
@@ -154,8 +277,7 @@ int arity;
 
 
 bool
-strprefix(string, prefix)
-register char *string, *prefix;
+strprefix(const char *string, const char *prefix)
 { while(*prefix && *string == *prefix)
     prefix++, string++;
   if (*prefix == EOS )
@@ -163,9 +285,9 @@ register char *string, *prefix;
   fail;
 }
 
+
 bool
-strpostfix(string, postfix)
-char *string, *postfix;
+strpostfix(const char *string, const char *postfix)
 { long offset = strlen(string) - strlen(postfix);
 
   if ( offset < 0 )
@@ -174,57 +296,39 @@ char *string, *postfix;
   return streq(&string[offset], postfix);
 }
 
+
+#ifndef HAVE_STRICMP
+int
+stricmp(const char *s1, const char *s2)
+{ while(*s1 && makeLower(*s1) == makeLower(*s2))
+    s1++, s2++;
+  
+  return makeLower(*s1) - makeLower(*s2);
+}
+#endif
+
+#ifndef HAVE_STRLWR
+char *
+strlwr(char *s)
+{ char *q;
+
+  for(q=s; *q; q++)
+    *q = makeLower(*q);
+
+  return s;
+}
+#endif
+
+
 bool
-strsub(string, sub)
-register char *string, *sub;
-{ register char *s, *sb;
+stripostfix(const char *s, const char *e)
+{ int ls = strlen(s);
+  int le = strlen(e);
 
-  while( *(s = string++) )
-  { for(sb=sub; *sb && *s == *sb; )
-      s++, sb++;
-    if ( *sb == EOS )
-      succeed;
-  }
-  fail;
-}
+  if ( ls >= le )
+    return stricmp(&s[ls-le], e) == 0;
 
-		/********************************
-		*        CHARACTER TYPES        *
-		*********************************/
+  return FALSE;
+} 
 
-char char_type[] = {
-/* ^@  ^A  ^B  ^C  ^D  ^E  ^F  ^G  ^H  ^I  ^J  ^K  ^L  ^M  ^N  ^O    0-15 */
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-/* ^P  ^Q  ^R  ^S  ^T  ^U  ^V  ^W  ^X  ^Y  ^Z  ^[  ^\  ^]  ^^  ^_   16-31 */
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-/* sp   !   "   #   $   %   &   '   (   )   *   +   ,   -   .   /   32-47 */
-   SP, SO, DQ, SY, SY, SO, SY, SQ, PU, PU, SY, SY, PU, SY, SY, SY, 
-/*  0   1   2   3   4   5   6   7   8   9   :   ;   <   =   >   ?   48-63 */
-   DI, DI, DI, DI, DI, DI, DI, DI, DI, DI, SY, SO, SY, SY, SY, SY, 
-/*  @   A   B   C   D   E   F   G   H   I   J   K   L   M   N   O   64-79 */
-   SY, UC, UC, UC, UC, UC, UC, UC, UC, UC, UC, UC, UC, UC, UC, UC, 
-/*  P   Q   R   S   T   U   V   W   X   Y   Z   [   \   ]   ^   _   80-95 */
-   UC, UC, UC, UC, UC, UC, UC, UC, UC, UC, UC, PU, SY, PU, SY, UC, 
-/*  `   a   b   c   d   e   f   g   h   i   j   k   l   m   n   o   96-111 */
-   SY, LC, LC, LC, LC, LC, LC, LC, LC, LC, LC, LC, LC, LC, LC, LC, 
-/*  p   q   r   s   t   u   v   w   x   y   z   {   |   }   ~  ^?   112-127 */
-   LC, LC, LC, LC, LC, LC, LC, LC, LC, LC, LC, PU, PU, PU, SY, SP, 
-			  /* 128-255 */
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, 
-   SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP, SP };
 
-void
-systemMode(accept)
-bool accept;
-{ char_type[(int)'$'] = (accept ? LC : SY);
-  if ( accept )
-    debugstatus.styleCheck |= DOLLAR_STYLE;
-  else
-    debugstatus.styleCheck &= ~DOLLAR_STYLE;
-}

@@ -1,13 +1,18 @@
-/*  pl-modul.c,v 1.3 1992/07/07 08:25:40 jan Exp
+/*  $Id: pl-modul.c,v 1.32 2001/07/05 22:05:19 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: module management
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #include "pl-incl.h"
+#define LOCK()   PL_LOCK(L_MODULE)
+#define UNLOCK() PL_UNLOCK(L_MODULE)
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Definition of modules.  A module consists of a  set  of  predicates.   A
@@ -22,20 +27,23 @@ the  global  module  for  the  user  and imports from `system' all other
 modules import from `user' (and indirect from `system').
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-Module
-lookupModule(name)
-Atom name;
+static Module
+_lookupModule(atom_t name)
 { Symbol s;
   Module m;
 
-  if ((s = lookupHTable(moduleTable, name)) != (Symbol) NULL)
+  if ((s = lookupHTable(GD->tables.modules, (void*)name)) != (Symbol) NULL)
     return (Module) s->value;
 
-  m = (Module) allocHeap(sizeof(struct module));
+  m = allocHeap(sizeof(struct module));
   m->name = name;
   m->file = (SourceFile) NULL;
+  m->operators = NULL;
+#ifdef O_PROLOG_HOOK
+  m->hook = NULL;
+#endif
   clearFlags(m);
-  set(m, UNKNOWN);
+  set(m, CHARESCAPE|UNKNOWN_ERROR);
 
   if ( name == ATOM_user || name == ATOM_system )
     m->procedures = newHTable(PROCEDUREHASHSIZE);
@@ -54,30 +62,62 @@ Atom name;
   if ( name == ATOM_system || stringAtom(name)[0] == '$' )
     set(m, SYSTEM);
 
-  addHTable(moduleTable, name, m);
-  statistics.modules++;
+  addHTable(GD->tables.modules, (void *)name, m);
+  GD->statistics.modules++;
+  PL_register_atom(name);
   
   return m;
 }
 
+
 Module
-isCurrentModule(name)
-Atom name;
-{ Symbol s;
+lookupModule(atom_t name)
+{ Module m;
 
-  if ((s = lookupHTable(moduleTable, name)) != (Symbol) NULL)
-    return (Module) s->value;
-
-  return (Module) NULL;
+  LOCK();
+  m = _lookupModule(name);
+  UNLOCK();
+  
+  return m;
 }
 
+
+Module
+isCurrentModule(atom_t name)
+{ Symbol s;
+  
+  if ( (s = lookupHTable(GD->tables.modules, (void*)name)) )
+    return (Module) s->value;
+
+  return NULL;
+}
+
+
 void
-initModules()
-{ moduleTable    = newHTable(MODULEHASHSIZE);
-  modules.system = lookupModule(ATOM_system);
-  modules.user   = lookupModule(ATOM_user);
-  modules.typein = modules.user;
-  modules.source = modules.user;
+initModules(void)
+{ LOCK();
+  if ( !GD->tables.modules )
+  { initTables();
+    initFunctors();
+
+    GD->tables.modules = newHTable(MODULEHASHSIZE);
+    GD->modules.system = _lookupModule(ATOM_system);
+    GD->modules.user   = _lookupModule(ATOM_user);
+    LD->modules.typein = MODULE_user;
+    LD->modules.source = MODULE_user;
+  }
+  UNLOCK();
+}
+
+int
+isSuperModule(Module s, Module m)
+{ while(m)
+  { if ( m == s )
+      succeed;
+    m = m->super;
+  }
+
+  fail;
 }
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -87,70 +127,60 @@ remaining term.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 Word
-stripModule(term, module)
-register Word term;
-Module *module;
-{ while(isTerm(*term) && functorTerm(*term) == FUNCTOR_module2)
-  { register Word mp;
+stripModule(Word term, Module *module)
+{ deRef(term);
+
+  while( hasFunctor(*term, FUNCTOR_module2) )
+  { Word mp;
     mp = argTermP(*term, 0);
     deRef(mp);
-    if (!isAtom(*mp) )
-    { warning("Illegal module specification");
-
-      return (Word) NULL;
-    }
-    *module = lookupModule((Atom) *mp);
+    if ( !isAtom(*mp) )
+      break;
+    *module = lookupModule(*mp);
     term = argTermP(*term, 1);
     deRef(term);
   }
 
-  if (*module == (Module) NULL)
-    *module = contextModule(environment_frame);
+  if ( ! *module )
+    *module = (environment_frame ? contextModule(environment_frame)
+	       			 : MODULE_user);
 
   return term;
 }
 
 bool
-isPublicModule(module, proc)
-Module module;
-Procedure proc;
-{ return lookupHTable(module->public, proc->functor) == (Symbol) NULL ? FALSE
-								      : TRUE;
-}
-
-bool
-isSuperModule(m, s)
-Module m, s;
-{ for( ; m; m = m->super )
-    if ( m == s )
-      succeed;
+isPublicModule(Module module, Procedure proc)
+{ if ( lookupHTable(module->public,
+		    (void *)proc->definition->functor->functor) )
+    succeed;
 
   fail;
 }
+
 
 		/********************************
 		*       PROLOG CONNECTION       *
 		*********************************/
 
 word
-pl_default_module(me, old, new)
-Word me, old, new;
+pl_default_module(term_t me, term_t old, term_t new)
 { Module m, s;
+  atom_t a;
 
-  if ( isVar(*me) )
+  if ( PL_is_variable(me) )
   { m = contextModule(environment_frame);
-    TRY( unifyAtomic(me, m->name) );
-  } else if ( isAtom(*me) )
-  { m = lookupModule((Atom) *me);
+    TRY(PL_unify_atom(me, m->name));
+  } else if ( PL_get_atom(me, &a) )
+  { m = lookupModule(a);
   } else
     return warning("super_module/2: instantiation fault");
 
-  TRY( unifyAtomic(old, m->super ? m->super->name : ATOM_nil) );
+  TRY(PL_unify_atom(old, m->super ? m->super->name : ATOM_nil));
 
-  if ( !isAtom(*new) )
+  if ( !PL_get_atom(new, &a) )
     return warning("super_module/2: instantiation fault");
 
-  s = (*new == (word) ATOM_nil ? (Module) NULL : lookupModule((Atom) *new));
+  s = (a == ATOM_nil ? NULL : lookupModule(a));
   m->super = s;
 
   succeed;
@@ -158,77 +188,204 @@ Word me, old, new;
 
 
 word
-pl_current_module(module, file, h)
-Word module, file;
-word h;
-{ Module m;
-  Atom f;
+pl_current_module(term_t module, term_t file, word h)
+{ TableEnum e = NULL;
   Symbol symb;
+  atom_t name;
 
-  switch( ForeignControl(h) )
-  { case FRG_FIRST_CALL:
-      symb = firstHTable(moduleTable);
-      break;
-    case FRG_REDO:
-      symb = (Symbol) ForeignContextAddress(h);
-      break;
-    case FRG_CUTTED:
-    default:
-      succeed;
+  if ( ForeignControl(h) == FRG_CUTTED )
+  { e = ForeignContextPtr(h);
+    freeTableEnum(e);
+    succeed;
+  }
+					/* deterministic cases */
+  if ( PL_get_atom(module, &name) )
+  { Module m;
+
+    if ( (m=isCurrentModule(name)) )
+    { atom_t f = (!m->file ? ATOM_nil : m->file->name);
+      return PL_unify_atom(file, f);
+    }
+
+    fail;
+  } else if ( PL_get_atom(file, &name) )
+  { int rval = FALSE;
+    for_table(GD->tables.modules, s,
+	      { Module m = s->value;
+
+		if ( m->file && m->file->name == name )
+		{ rval = PL_unify_atom(module, m->name);
+		  break;
+		}
+	      })
+    return rval;
   }
 
-  for(; symb; symb = nextHTable(moduleTable, symb) )
-  { m = (Module) symb->value;
-    if ( stringAtom(m->name)[0] == '$' && !SYSTEM_MODE && isVar(*module) )
-      continue;
-    if (unifyAtomic(module, m->name) == FALSE)
-      continue;
-    f = (m->file == (SourceFile) NULL ? ATOM_nil : m->file->name);
-    if (unifyAtomic(file, f) == FALSE)
+  switch(ForeignControl(h))
+  { case FRG_FIRST_CALL:
+      e = newTableEnum(GD->tables.modules);
+      break;
+    case FRG_REDO:
+      e = ForeignContextPtr(h);
+      break;
+    default:
+      assert(0);
+  }
+
+  while( (symb = advanceTableEnum(e)) )
+  { Module m = symb->value;
+
+    if ( stringAtom(m->name)[0] == '$' &&
+	 !SYSTEM_MODE && PL_is_variable(module) )
       continue;
 
-    if ((symb = nextHTable(moduleTable, symb)) == (Symbol) NULL)
-      succeed;
+    { fid_t cid = PL_open_foreign_frame();
+      atom_t f = ( !m->file ? ATOM_nil : m->file->name);
 
-    ForeignRedo(symb);
+      if ( PL_unify_atom(module, m->name) &&
+	   PL_unify_atom(file, f) )
+      { ForeignRedoPtr(e);
+      }
+
+      PL_discard_foreign_frame(cid);
+    }
+  }
+
+  freeTableEnum(e);
+  fail;
+}
+
+
+word
+pl_strip_module(term_t spec, term_t module, term_t term)
+{ Module m = (Module) NULL;
+  term_t plain = PL_new_term_ref();
+
+  PL_strip_module(spec, &m, plain);
+  if ( PL_unify_atom(module, m->name) &&
+       PL_unify(term, plain) )
+    succeed;
+
+  fail;
+}  
+
+
+word
+pl_module(term_t old, term_t new)
+{ if ( PL_unify_atom(old, LD->modules.typein->name) )
+  { atom_t name;
+
+    if ( !PL_get_atom(new, &name) )
+      return PL_error(NULL, 0, NULL, ERR_DOMAIN,
+		      PL_new_atom("module"), /* ATOM_module = ":" */
+		      new);
+
+    LD->modules.typein = lookupModule(name);
+    succeed;
   }
 
   fail;
 }
 
-word
-pl_strip_module(spec, module, term)
-Word spec, module, term;
-{ Module m = (Module) NULL;
-
-  if ( (spec = stripModule(spec, &m)) == (Word) NULL )
-    fail;
-  TRY(unifyAtomic(module, m->name) );
-
-  return pl_unify(spec, term);
-}  
 
 word
-pl_module(old, new)
-Word old, new;
-{ TRY(unifyAtomic(old, modules.typein->name) );
-  if (!isAtom(*new) )
-    return warning("module/1: argument should be an atom");
-  modules.typein = lookupModule((Atom)*new);
-  
-  succeed;
+pl_set_source_module(term_t old, term_t new)
+{ if ( PL_unify_atom(old, LD->modules.source->name) )
+  { atom_t name;
+
+    if ( !PL_get_atom(new, &name) )
+      return PL_error(NULL, 0, NULL, ERR_DOMAIN,
+		      PL_new_atom("module"), /* ATOM_module = ":" */
+		      new);
+
+    LD->modules.source = lookupModule(name);
+    succeed;
+  }
+
+  fail;
 }
 
+
+#ifdef O_PROLOG_HOOK
 word
-pl_set_source_module(old, new)
-Word old, new;
-{ TRY(unifyAtomic(old, modules.source->name) );
-  if (!isAtom(*new) )
-    return warning("$source_module/1: argument should be an atom");
-  modules.source = lookupModule((Atom)*new);
-  
-  succeed;
+pl_set_prolog_hook(term_t module, term_t old, term_t new)
+{ Module m;
+  atom_t mname;
+
+  if ( !PL_get_atom(module, &mname) )
+    PL_error(NULL, 0, NULL, ERR_TYPE, ATOM_atom, module);
+  m = lookupModule(mname);
+
+  if ( m->hook )
+  { if ( !unify_definition(old, m->hook->definition, 0, GP_HIDESYSTEM) )
+      return FALSE;
+  } else
+  { if ( !PL_unify_nil(old) )
+      return FALSE;
+  }
+
+  if ( PL_get_nil(new) )
+  { m->hook = NULL;
+    return TRUE;
+  } else
+    return get_procedure(new, &m->hook, 0, GP_NAMEARITY|GP_CREATE);
 }
+#endif
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Find the module in which to call   term_expansion/2. This is the current
+source-module and module user, provide term_expansion/2 is defined. Note
+this predicate does not generate modules for which there is a definition
+that has no clauses. The predicate would fail anyhow.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static word
+expansion_module(term_t name, functor_t func, word h)
+{ Module m = LD->modules.source;
+  Procedure proc;
+
+  switch(ForeignControl(h))
+  { case FRG_FIRST_CALL:
+      m = LD->modules.source;
+      break;
+    case FRG_REDO:
+      m = MODULE_user;
+      break;
+    default:
+      succeed;
+  }
+
+  while(1)
+  { if ( (proc = isCurrentProcedure(func, m)) &&
+	 proc->definition->definition.clauses &&
+	 PL_unify_atom(name, m->name) )
+    { if ( m == MODULE_user )
+	PL_succeed;
+      else
+	ForeignRedoInt(1);
+    } else
+    { if ( m == MODULE_user )
+	PL_fail;
+      m = MODULE_user;
+    }
+  }
+
+  PL_fail;				/* should not get here */
+}
+
+
+word
+pl_term_expansion_module(term_t name, word h)
+{ return expansion_module(name, FUNCTOR_term_expansion2, h);
+}
+
+
+word
+pl_goal_expansion_module(term_t name, word h)
+{ return expansion_module(name, FUNCTOR_goal_expansion2, h);
+}
+
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Declare `name' to be a module with `file' as its source  file.   If  the
@@ -236,39 +393,47 @@ module was already loaded its public table is cleared and all procedures
 in it are abolished.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-
-word
-pl_declare_module(name, file)
-Word name, file;
+int
+declareModule(atom_t name, SourceFile sf)
 { Module module;
-  Symbol s;
-  SourceFile sf;
 
-  if (!isAtom(*name) || !isAtom(*file) )
-    return warning("$declare_module/2: instantiation fault");
-
-  module = lookupModule((Atom)*name);
-
-  sf = lookupSourceFile((Atom)*file);
-  if (module->file != (SourceFile) NULL && module->file != sf)
-    return warning("module/2: module %s already loaded from file %s (abandoned)", 
-				stringAtom(module->name), 
-				stringAtom(module->file->name) );
-  module->file = sf;
-
-  modules.source = module;
-
-  for_table(s, module->procedures)
-  { Procedure proc = (Procedure) s->value;
-    Definition def = proc->definition;
-    if ( def->module == module &&
-	 false(def, DYNAMIC) &&
-	 false(def, MULTIFILE) )
-      abolishProcedure(proc, module);
+  module = lookupModule(name);
+  LOCK();
+  if ( module->file && module->file != sf)
+  { warning("module/2: module %s already loaded from file %s (abandoned)", 
+	    stringAtom(module->name), 
+	    stringAtom(module->file->name));
+    fail;
   }
+	    
+  module->file = sf;
+  LD->modules.source = module;
+
+  for_table(module->procedures, s,
+	    { Procedure proc = s->value;
+	      Definition def = proc->definition;
+	      if ( def->module == module &&
+		   !true(def, DYNAMIC|MULTIFILE|FOREIGN) )
+		abolishProcedure(proc, module);
+	    })
   clearHTable(module->public);
+  UNLOCK();
   
   succeed;
+}
+
+
+word
+pl_declare_module(term_t name, term_t file)
+{ SourceFile sf;
+  atom_t mname, fname;
+
+  if ( !PL_get_atom(name, &mname) ||
+       !PL_get_atom(file, &fname) )
+    return warning("$declare_module/2: instantiation fault");
+
+  sf = lookupSourceFile(fname);
+  return declareModule(mname, sf);
 }
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -276,25 +441,36 @@ export_list(+Module, -PublicPreds)
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 word
-pl_export_list(modulename, list)
-Word modulename, list;
+pl_export_list(term_t modulename, term_t public)
 { Module module;
-  Symbol s;
+  atom_t mname;
 
-  if ( !isAtom(*modulename) )
-    return warning("export_list/2: instantiation fault");
+  if ( !PL_get_atom(modulename, &mname) )
+    return PL_error(NULL, 0, NULL, ERR_DOMAIN,
+		    PL_new_atom("module"), /* ATOM_module = ":" */
+		    modulename);
   
-  if ((module = isCurrentModule((Atom) *modulename)) == NULL)
+  if ( !(module = isCurrentModule(mname)) )
     fail;
   
-  for_table(s, module->public)
-  { TRY(unifyFunctor(list, FUNCTOR_dot2));
-    TRY(unifyFunctor(HeadList(list), (FunctorDef)s->name));
-    list = TailList(list);
-    deRef(list);
+  { term_t head = PL_new_term_ref();
+    term_t list = PL_copy_term_ref(public);
+    int rval = TRUE;
+
+    LOCK();
+    for_table(module->public, s,
+	      { if ( !PL_unify_list(list, head, list) ||
+		     !PL_unify_functor(head, (functor_t)s->name) )
+		{ rval = FALSE;
+		  break;
+		}
+	      })
+    UNLOCK();
+    if ( rval )
+      return PL_unify_nil(list);
+
+    fail;
   }
-  
-  return unifyAtomic(list, ATOM_nil);
 }
 
 
@@ -304,48 +480,54 @@ context module.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 word
-pl_export(head)
-Word head;
-{ Procedure proc;
-  Module module = (Module) NULL;
+pl_export(term_t pred)
+{ Module module = NULL;
+  term_t head = PL_new_term_ref();
+  functor_t fd;
 
-  if ((head = stripModule(head, &module)) == (Word) NULL)
-    fail;
+  PL_strip_module(pred, &module, head);
+  if ( PL_get_functor(head, &fd) )
+  { Procedure proc;
 
-  if ( isAtom(*head) )
-    proc = lookupProcedure(lookupFunctorDef((Atom)*head, 0), module);
-  else if ( isTerm(*head) )
-    proc = lookupProcedure(functorTerm(*head), module);
-  else
-    return warning("export/1: illegal predicate specification");
+    if ( (proc = isStaticSystemProcedure(fd)) )
+      return PL_error(NULL, 0, NULL, ERR_PERMISSION_PROC,
+		      ATOM_export, ATOM_built_in_procedure, proc->definition);
 
-  addHTable(module->public, proc->functor, proc);
+    LOCK();
+    proc = lookupProcedure(fd, module);
+    addHTable(module->public,
+	      (void *)proc->definition->functor->functor,
+	      proc);
+    UNLOCK();
+    succeed;
+  }
 
-  succeed;
+  return PL_error(NULL, 0, NULL, ERR_TYPE, ATOM_callable, pred);
 }
 
 word
 pl_check_export()
 { Module module = contextModule(environment_frame);
-  Symbol s;
 
-  for_table(s, module->public)
-  { Procedure proc = (Procedure) s->value;
-    if (isDefinedProcedure(proc) == FALSE)
-    { warning("Exported procedure %s:%s/%d is not defined", 
-				  stringAtom(module->name), 
-				  stringAtom(proc->functor->name), 
-				  proc->functor->arity);
-    }
-  }
+  for_table(module->public, s,
+	    { Procedure proc = (Procedure) s->value;
+	      Definition def = proc->definition;
+
+	      if ( !isDefinedProcedure(proc) && /* not defined */
+		   proc->definition->module == module ) /* not imported */
+	      { warning("Exported procedure %s:%s/%d is not defined", 
+			stringAtom(module->name), 
+			stringAtom(def->functor->name), 
+			def->functor->arity);
+	      }
+	    })
 
   succeed;
 }
 
 word
-pl_context_module(module)
-Word module;
-{ return unifyAtomic(module, contextModule(environment_frame)->name);
+pl_context_module(term_t module)
+{ return PL_unify_atom(module, contextModule(environment_frame)->name);
 }
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -354,31 +536,66 @@ current  context  module.   If  the  predicate is already defined in the
 context a warning is displayed and the predicate is  NOT  imported.   If
 the  predicate  is  not  on  the  public  list of the exporting module a
 warning is displayed, but the predicate is imported nevertheless.
+
+A particulary nasty problem happens  if   a  procedure  is exported from
+module A to B and then to C, while C   loads B before B loads A. In this
+case C will share the definition of B, which is subsequently overwritten
+when B imports A. The fixExport() stuff deals with this situation. It is
+considered very rare and probably scanning  all predicate definitions is
+fine.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+static inline void
+fixExportModule(Module m, Definition old, Definition new)
+{ for_unlocked_table(m->procedures, s,
+		     { Procedure proc = s->value;
+
+		       if ( proc->definition == old )
+		       { DEBUG(1, Sdprintf("Patched def of %s\n",
+					   procedureName(proc)));
+			 proc->definition = new;
+		       }
+		     });
+}
+
+
+static void
+fixExport(Definition old, Definition new)
+{ LOCK();
+  for_unlocked_table(GD->tables.modules, s,
+		     fixExportModule(s->value, old, new));
+  UNLOCK();
+}
+
+
 word
-pl_import(pred)
-Word pred;
-{ Module source = (Module) NULL;
+pl_import(term_t pred)
+{ Module source = NULL;
   Module destination = contextModule(environment_frame);
+  term_t head = PL_new_term_ref();
+  functor_t fd;
   Procedure proc, old;
 
-  if ((pred = stripModule(pred, &source)) == (Word) NULL)
-    fail;
+  PL_strip_module(pred, &source, head);
+  if ( !PL_get_functor(head, &fd) )
+    return warning("import/1: instantiation fault");
+  proc = lookupProcedure(fd, source);
 
-  if (isAtom(*pred) )
-    proc = lookupProcedure(lookupFunctorDef((Atom)*pred, 0), source);
-  else if (isTerm(*pred) )
-    proc = lookupProcedure(functorTerm(*pred), source);
-  else
-    return warning("import/1: illegal predicate specification");
+  if ( !isDefinedProcedure(proc) )
+    autoImport(proc->definition->functor->functor, proc->definition->module);
 
-  if ((old = isCurrentProcedure(proc->functor, destination)) != (Procedure) NULL)
+  if ( (old = isCurrentProcedure(proc->definition->functor->functor,
+				 destination)) )
   { if ( old->definition == proc->definition )
       succeed;			/* already done this! */
 
     if ( !isDefinedProcedure(old) )
-    { old->definition = proc->definition;
+    { Definition odef = old->definition;
+
+      old->definition = proc->definition;
+      if ( true(odef, P_SHARED) )
+	fixExport(odef, proc->definition);
+      set(proc->definition, P_SHARED);
 
       succeed;
     }
@@ -388,7 +605,7 @@ Word pred;
 		     procedureName(proc), 
 		     stringAtom(destination->name) );
 
-    if (old->definition->module != source)
+    if ( old->definition->module != source )
     { warning("Cannot import %s into module %s: already imported from %s", 
 	      procedureName(proc), 
 	      stringAtom(destination->name), 
@@ -402,7 +619,7 @@ Word pred;
     fail;
   }
 
-  if (isPublicModule(source, proc) == FALSE)
+  if ( !isPublicModule(source, proc) )
   { warning("import/1: %s is not declared public (still imported)", 
 	    procedureName(proc));
   }
@@ -410,11 +627,16 @@ Word pred;
   { Procedure nproc = (Procedure)  allocHeap(sizeof(struct procedure));
   
     nproc->type = PROCEDURE_TYPE;
-    nproc->functor = proc->functor;
     nproc->definition = proc->definition;
+    set(proc->definition, P_SHARED);
   
-    addHTable(destination->procedures, proc->functor, nproc);
+    LOCK();
+    addHTable(destination->procedures,
+	      (void *)proc->definition->functor->functor, nproc);
+    UNLOCK();
   }
 
   succeed;
 }
+
+

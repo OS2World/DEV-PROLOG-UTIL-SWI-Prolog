@@ -1,4 +1,4 @@
-/*  files.pl,v 1.1.1.1 1992/05/26 11:51:36 jan Exp
+/*  $Id: files.pl,v 1.3 1999/10/12 08:14:09 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -31,8 +31,8 @@ can_open_file(File, both) :-
 	access_file(File, write).
 
 path_dir_name(File, Dir) :-
-	'$file_base_name'(File, Base),
-	concat(RawDir, Base, File),
+	file_base_name(File, Base),
+	atom_concat(RawDir, Base, File),
 	(   RawDir == ''
 	->  Dir = '.'
 	;   Dir = RawDir

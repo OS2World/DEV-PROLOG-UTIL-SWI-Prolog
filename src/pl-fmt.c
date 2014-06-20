@@ -1,10 +1,13 @@
-/*  pl-fmt.c,v 1.4 1993/02/23 13:16:31 jan Exp
+/*  $Id: pl-fmt.c,v 1.37 2000/05/25 09:30:10 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Formated write
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -14,16 +17,12 @@ source should also use format() to produce error messages, etc.
 
 #include "pl-incl.h"
 #include "pl-ctype.h"
-#include "pl-itf.h"
-extern int Output;
 
 #define BUFSIZE 	10240
 #define DEFAULT 	(-1)
 #define SHIFT   	{ argc--; argv++; }
 #define NEED_ARG	{ if ( argc <= 0 ) \
 			  { ERROR("not enough arguments"); \
-			  } else \
-			  { deRef2(argv, a); \
 			  } \
 			}
 #define ERROR(fmt)	return warning("format/2: %s", fmt)
@@ -38,7 +37,7 @@ extern int Output;
 #define OUTCHR(c)	{ if ( pending_rubber ) \
 			    buffer[index++] = (c); \
 			  else \
-			    Put((Char)(c)); \
+			    Sputc((Char)(c), fd); \
 			  column = update_column(column, c); \
 			}
 
@@ -50,193 +49,174 @@ struct rubber
   Char pad;				/* padding character */
 };
 
-static Table format_predicates;		/* Prolog defined fromatting */
+#define format_predicates (GD->format.predicates)
 
-forwards int	update_column P((int, Char));
-forwards bool	do_format P((char *fmt, int argc, Word argv));
-forwards void	distribute_rubber P((struct rubber *, int, int));
-forwards void	emit_rubber P((char *buf, int, struct rubber *, int));
+static int	update_column(int, Char);
+static bool	do_format(IOSTREAM *fd,
+			  const char *fmt, unsigned len, int ac, term_t av);
+static void	distribute_rubber(struct rubber *, int, int);
+static void	emit_rubber(IOSTREAM *fd, char *, int, struct rubber *, int);
 
 		/********************************
 		*       PROLOG CONNECTION	*
 		********************************/
 
 word
-pl_format_predicate(chr, descr)
-Word chr, descr;
+pl_format_predicate(term_t chr, term_t descr)
 { long c;
   Procedure proc;
   Symbol s;
 
-  if ( isInteger(*chr) )
-  { c = valNum(*chr);
-    if ( c < 0 || c > 255 )
+  if ( !PL_get_long(chr, &c) || c < 0 || c > 255 )
+  { char *s;
+    
+    if ( PL_get_atom_chars(chr, &s) && s[0] && !s[1] )
+      c = s[0] & 0xff;
+    else
       return warning("format_predicate/2: illegal character");
-  } else if ( isAtom(*chr) )
-  { c = stringAtom(*chr)[0];
-  } else
-    return warning("format_predicate/2: illegal character");
+  }
 
-  if ( (proc = findCreateProcedure(descr)) == NULL )
+  if ( !get_procedure(descr, &proc, 0, GP_CREATE) )
     fail;
-  if ( proc->functor->arity == 0 )
+  if ( proc->definition->functor->arity == 0 )
     return warning("format_predicate/2: predicate must have at least 1 argument");
 
-  if ( format_predicates == NULL )
-    format_predicates = newHTable(64);
+  if ( !format_predicates )
+    format_predicates = newHTable(8);
   
-  if ( (s = lookupHTable(format_predicates, (Void)c)) != NULL )
-    s->value = (word) proc;
+  if ( (s = lookupHTable(format_predicates, (void *)c)) )
+    s->value = proc;
   else
-    addHTable(format_predicates, (Void)c, proc);
+    addHTable(format_predicates, (void *)c, proc);
 
   succeed;
 }
 
 
 word
-pl_format(fmt, args)
-Word fmt;
-register Word args;
-{ Word argv;
-  word rval;
-  int argc = 0;
-  char *f;
+pl_current_format_predicate(term_t chr, term_t descr, control_t h)
+{ Symbol s = NULL;
+  TableEnum e;
   mark m;
 
-  if ( isAtom(*fmt) )
-    f = stringAtom(*fmt);
-  else if ( isString(*fmt) )
-    f = valString(*fmt);
-  else if ( (f = listToString(*fmt)) != NULL )
-    f = store_string(f);
-  else
-    return warning("format/2: format is not an atom or string");
-
-  Mark(m);
-  deRef(args);
-  if ( isNil(*args) )
-  { argc = 0;
-    argv = NULL;
-  } else if ( !isList(*args) )
-  { argc = 1;
-    argv = args;
-  } else
-  { Word ap;
-
-    if ( (argc = lengthList(args)) < 0 )
-      return warning("format/2: argument list is not proper");
-    ap = argv = allocGlobal(argc * sizeof(word));
-
-    while( isList(*args) )
-    { Word a = HeadList(args);
-
-      deRef(a);
-      *ap++ = (isVar(*a) ? makeRef(a) : *a);
-
-      args = TailList(args);
-      deRef(args);
-    }
+  switch( ForeignControl(h) )
+  { case FRG_FIRST_CALL:
+      if ( !format_predicates )
+	fail;
+      e = newTableEnum(format_predicates);
+      break;
+    case FRG_REDO:
+      e = ForeignContextPtr(h);
+      break;
+    case FRG_CUTTED:
+      e = ForeignContextPtr(h);
+      freeTableEnum(e);
+    default:
+      succeed;
   }
 
-  rval = do_format(f, argc, argv);
-  Undo(m);
+  while( (s=advanceTableEnum(e)) )
+  { Mark(m);
 
-  return rval;
+    if ( PL_unify_integer(chr, (long)s->name) &&
+	 unify_definition(descr, ((Procedure)s->value)->definition, 0, 0) )
+    { ForeignRedoPtr(e);
+    }
+    Undo(m);
+  }
+
+  freeTableEnum(e);
+  fail;
 }
+
 
 word
-pl_format3(stream, fmt, args)
-Word stream, fmt, args;
-{ streamOutput(stream, pl_format(fmt, args));
-}
+pl_format3(term_t stream, term_t fmt, term_t Args)
+{ term_t argv;
+  int argc = 0;
+  char *f;
+  term_t args = PL_copy_term_ref(Args);
+  IOSTREAM *out;
+  int rval;
+  unsigned len;
 
-#if O_C_FORMAT
+  if ( !getOutputStream(stream, &out) )
+    fail;
 
-		/********************************
-		*          C-CONNECTION		*
-		********************************/
+  if ( !PL_get_nchars(fmt, &len, &f, CVT_ALL|BUF_RING) )
+    return PL_error("format", 3, NULL, ERR_TYPE, ATOM_text, fmt);
 
-static bool
-vformat(fm, args)
-char *fm;
-va_list args;
-{ 
-}
+  if ( (argc = lengthList(args, FALSE)) >= 0 )
+  { term_t head = PL_new_term_ref();
+    int n = 0;
 
-#if ANSI
-bool
-format(char *fm, ...)
-{ va_list args;
-  bool rval;
+    argv = PL_new_term_refs(argc);
+    while( PL_get_list(args, head, args) )
+      PL_put_term(argv+n++, head);
+  } else
+  { argc = 1;
+    argv = PL_new_term_refs(argc);
 
-  va_start(args, fm);
-  rval = vformat(fm, args);
-  va_end(args);
-
-  return rval;
-}
-
-#else
-
-bool
-format(va_alist)
-va_dcl
-{ va_list args;
-  char *fm;
-  bool rval;
-
-  va_start(args);
-  fm = va_arg(args, char *);
-  rval = vformat(fm, args);
-  va_end(args);
+    PL_put_term(argv, args);
+  }
+  
+  rval = do_format(out, f, len, argc, argv);
+  PL_release_stream(out);
 
   return rval;
 }
-#endif /* ANSI */
 
-#endif /* O_C_FORMAT */
+
+word
+pl_format(term_t fmt, term_t args)
+{ return pl_format3(0, fmt, args);
+}
+
 		/********************************
 		*       ACTUAL FORMATTING	*
 		********************************/
 
 static int
-update_column(col, c)
-register int col;
-register Char c;
+update_column(int col, int c)
 { switch(c)
   { case '\n':	return 0;
+    case '\r':  return 0;
     case '\t':	return (col + 1) | 0x7;
     case '\b':	return (col <= 0 ? 0 : col - 1);
     default:	return col + 1;
   }
 }   
 
+
 static bool
-do_format(fmt, argc, argv)
-char *fmt;
-int argc;
-Word argv;
+do_format(IOSTREAM *fd, const char *fmt, unsigned len, int argc, term_t argv)
 { char buffer[BUFSIZE];			/* to store chars with tabs */
   int index = 0;			/* index in buffer */
-  int column = currentLinePosition();	/* current output column */
+  int column;				/* current output column */
   int tab_stop = 0;			/* padded tab stop */
   int pending_rubber = 0;		/* number of not-filled ~t's */
   struct rubber rub[MAXRUBBER];
   Symbol s;
+  const char *end = fmt+len;
 
-  while(*fmt)
+  Slock(fd);				/* buffer locally */
+
+  if ( fd->position )
+    column = fd->position->linepos;
+  else
+    column = 0;
+
+  while(fmt < end)
   { switch(*fmt)
     { case '~':
 	{ int arg = DEFAULT;		/* Numeric argument */
-	  Word a;			/* (List) argument */
 					/* Get the numeric argument */
 	  if ( isDigit(*++fmt) )
 	  { for( ; isDigit(*fmt); fmt++ )
 	      arg = (arg == DEFAULT ? arg = *fmt - '0' : arg*10 + *fmt - '0');
 	  } else if ( *fmt == '*' )
 	  { NEED_ARG;
-	    if ( isInteger(*a) && (arg = (int)valNum(*a)) >= 0 )
+	    if ( PL_get_integer(argv, &arg) )
 	    { SHIFT;
 	    } else
 	      ERROR("no or negative integer for `*' argument");
@@ -247,39 +227,37 @@ Word argv;
 	  }
 	    
 					/* Check for user defined format */
-	  if ( format_predicates != NULL &&
-#if gould
-	       (s = lookupHTable(format_predicates, (ulong)*fmt)) != NULL )
-#else
-	       (s = lookupHTable(format_predicates,
-				 (Void)((long)*fmt))) != NULL )
-#endif
+	  if ( format_predicates &&
+	       (s = lookupHTable(format_predicates, (Void)((long)*fmt))) )
 	  { Procedure proc = (Procedure) s->value;
+	    FunctorDef fdef = proc->definition->functor;
+	    term_t av = PL_new_term_refs(fdef->arity);
 	    char buf[BUFSIZE];
-	    mark m;
-	    word goal;
-	    Word g;
-	    int n;
+	    char *str = buf;
+	    int bufsize = BUFSIZE;
+	    int i;
+	    qid_t qid;
 
-	    Mark(m);
-	    goal = globalFunctor(FUNCTOR_module2);
-	    unifyAtomic(argTermP(goal, 0), proc->definition->module->name);
-	    unifyAtomic(argTermP(goal, 1), globalFunctor(proc->functor));
-	    g = argTermP(goal, 1);
-	    unifyAtomic(argTermP(*g, 0), arg == DEFAULT ? (word)ATOM_default
-						        : consNum(arg));
-	    for(n = 1; n < proc->functor->arity; n++)
+	    if ( arg == DEFAULT )
+	      PL_put_atom(av+0, ATOM_default);
+	    else
+	      PL_put_integer(av+0, arg);
+
+	    for(i=1; i<fdef->arity; i++)
 	    { NEED_ARG;
-	      pl_unify(argTermP(*g, n), a);
+	      PL_put_term(av+i, argv);
 	      SHIFT;
 	    }
-	    tellString(buf, BUFSIZE);
-	    debugstatus.suspendTrace++;
-	    callGoal(MODULE_user, goal, FALSE);
-	    debugstatus.suspendTrace--;
+
+	    tellString(&str, &bufsize);
+	    qid = PL_open_query(proc->definition->module, PL_Q_NODEBUG,
+				proc, av);
+	    PL_next_solution(qid);
+	    PL_close_query(qid);
 	    toldString();
-	    OUTSTRING(buf);
-	    Undo(m);
+	    OUTSTRING(str);
+	    if ( str != buf )
+	      free(str);
 
 	    fmt++;
 	  } else
@@ -288,7 +266,7 @@ Word argv;
 		{ char *s;
 
 		  NEED_ARG;
-		  if ( (s = primitiveToString(*a, FALSE)) == (char *) NULL )
+		  if ( !PL_get_chars(argv, &s, CVT_ATOMIC) )
 		    ERROR("illegal argument to ~a");
 		  SHIFT;
 		  OUTSTRING(s);
@@ -296,14 +274,16 @@ Word argv;
 		  break;
 		}
 	      case 'c':			/* ascii */
-		{ NEED_ARG;
-		  if ( isInteger(*a) )
-		  { Char c = (int)valNum(*a);
+		{ int c;
 
-		    if ( c < 0 || c > 255 )
-		      ERROR("illegal argument to ~c");
-		    OUTCHR(c);
+		  NEED_ARG;
+		  if ( PL_get_integer(argv, &c) && c>=0 && c<=255 )
+		  { int times = (arg == DEFAULT ? 1 : arg);
+
 		    SHIFT;
+		    while(times-- > 0)
+		    { OUTCHR(c);
+		    }
 		  } else
 		    ERROR("illegal argument to ~c");
 		  fmt++;
@@ -314,16 +294,16 @@ Word argv;
 	      case 'f':			/* float */
 	      case 'g':			/* shortest of 'f' and 'e' */
 	      case 'G':			/* shortest of 'f' and 'E' */
-		{ real f;
+		{ double f;
 		  char tmp[12];
 		  char buf[256];
 
 		  NEED_ARG;
-		  if ( wordToReal(*a, &f) == FALSE )
+		  if ( !PL_get_float(argv, &f) )
 		    ERROR1("illegal argument to ~%c", *fmt);
 		  SHIFT;
-		  sprintf(tmp, "%%.%d%c", arg == DEFAULT ? 6 : arg, *fmt);
-		  sprintf(buf, tmp, f);
+		  Ssprintf(tmp, "%%.%d%c", arg == DEFAULT ? 6 : arg, *fmt);
+		  Ssprintf(buf, tmp, f);
 		  OUTSTRING(buf);
 		  fmt++;
 		  break;
@@ -332,20 +312,20 @@ Word argv;
 	      case 'D':			/* grouped integer */
 	      case 'r':			/* radix number */
 	      case 'R':			/* Radix number */
-		{ long i;
-		  char *s;
+		{ int i;
+		  char tmp[50];
 
 		  NEED_ARG;
-		  if ( wordToInteger(*a, &i) == FALSE )
+		  if ( !PL_get_integer(argv, &i) )
 		    ERROR1("illegal argument to ~%c", *fmt);
 		  SHIFT;
 		  if ( arg == DEFAULT )
 		    arg = 0;
-		  s = ( (*fmt == 'd' || *fmt == 'D')
-			? formatInteger(*fmt == 'D', arg, 10, TRUE, i)
-			: formatInteger(FALSE, 0, arg, *fmt == 'r', i)
-		      );
-		  OUTSTRING(s);			
+		  if ( *fmt == 'd' || *fmt == 'D' )
+		    formatInteger(*fmt == 'D', arg, 10, TRUE, i, tmp);
+		  else
+		    formatInteger(FALSE, 0, arg, *fmt == 'r', i, tmp);
+		  OUTSTRING(tmp);			
 		  fmt++;
 		  break;
 		}
@@ -353,7 +333,7 @@ Word argv;
 		{ char *s;
 
 		  NEED_ARG;
-		  if ( (s = listToString(*a)) == (char *)NULL )
+		  if ( !PL_get_chars(argv, &s, CVT_LIST|CVT_STRING) )
 		    ERROR("illegal argument to ~s");
 		  OUTSTRING(s);
 		  SHIFT;
@@ -368,26 +348,100 @@ Word argv;
 		}
 		{ Func f;
 		  char buf[BUFSIZE];
+		  char *str;
 
-	      case 'k':			/* displayq */
-		  f = pl_displayq;	goto pl_common;
+	      case 'k':			/* write_canonical */
+		  f = pl_write_canonical; 
+	          goto pl_common;
 	      case 'p':			/* print */
-		  f = pl_print;		goto pl_common;
+		  f = pl_print;
+	          goto pl_common;
 	      case 'q':			/* writeq */
-		  f = pl_writeq;	goto pl_common;
+		  f = pl_writeq;
+	          goto pl_common;
 	      case 'w':			/* write */
 		  f = pl_write;
 		  pl_common:
 
 		  NEED_ARG;
-		  tellString(buf, BUFSIZE);
-		  (*f)(a);
-		  toldString();
+		  if ( pending_rubber )
+		  { int bufsize = BUFSIZE;
+
+		    str = buf;
+		    tellString(&str, &bufsize);
+		    (*f)(argv);
+		    toldString();
+		    OUTSTRING(str);
+		    if ( str != buf )
+		      free(str);
+		  } else
+		  { if ( fd->position && fd->position->linepos == column )
+		    { IOSTREAM *old = Scurout;
+
+		      Scurout = fd;
+		      (*f)(argv);
+		      Scurout = old;
+
+		      column = fd->position->linepos;
+		    } else
+		    { int bufsize = BUFSIZE;
+
+		      str = buf;
+		      tellString(&str, &bufsize);
+		      (*f)(argv);
+		      toldString();
+		      OUTSTRING(str);
+		      if ( str != buf )
+			free(str);
+		    }
+		  }
 		  SHIFT;
-		  OUTSTRING(buf);
 		  fmt++;
 		  break;
 		}
+	      case 'W':			/* write_term(Value, Options) */
+	       { char buf[BUFSIZE];
+		 char *str;
+
+		 if ( argc < 2 )
+		 { ERROR("not enough arguments");
+		 }
+		 if ( pending_rubber )
+		  { int bufsize = BUFSIZE;
+
+		    str = buf;
+		    tellString(&str, &bufsize);
+		    pl_write_term(argv, argv+1);
+		    toldString();
+		    OUTSTRING(str);
+		    if ( str != buf )
+		      free(str);
+		  } else
+		  { if ( fd->position && fd->position->linepos == column )
+		    { IOSTREAM *old = Scurout;
+
+		      Scurout = fd;
+		      pl_write_term(argv, argv+1);
+		      Scurout = old;
+
+		      column = fd->position->linepos;
+		    } else
+		    { int bufsize = BUFSIZE;
+
+		      str = buf;
+		      tellString(&str, &bufsize);
+		      pl_write_term(argv, argv+1);
+		      toldString();
+		      OUTSTRING(str);
+		      if ( str != buf )
+			free(str);
+		    }
+		  }
+		  SHIFT;
+		  SHIFT;
+		  fmt++;
+		  break;
+	       }
 	      case '~':			/* ~ */
 		{ OUTCHR('~');
 		  fmt++;
@@ -428,7 +482,7 @@ Word argv;
 		    pending_rubber++;
 		  }
 		  distribute_rubber(rub, pending_rubber, stop - column);
-		  emit_rubber(buffer, index, rub, pending_rubber);
+		  emit_rubber(fd, buffer, index, rub, pending_rubber);
 		  index = 0;
 		  pending_rubber = 0;
 
@@ -451,16 +505,16 @@ Word argv;
   }
 
   if ( pending_rubber )			/* not closed ~t: flush out */
-    emit_rubber(buffer, index, rub, 0);
+    emit_rubber(fd, buffer, index, rub, 0);
 
-  succeed;
+  Sunlock(fd);
+
+  return streamStatus(fd);
 }
 
+
 static void
-distribute_rubber(r, rn, space)
-struct rubber *r;
-int rn;
-int space;
+distribute_rubber(struct rubber *r, int rn, int space)
 { if ( space > 0 )
   { int s = space / rn;
     int n, m;
@@ -480,23 +534,20 @@ int space;
   }
 }
 
+
 static void
-emit_rubber(buf, i, r, rn)
-char *buf;
-int i;
-struct rubber *r;
-int rn;
+emit_rubber(IOSTREAM *fd, char *buf, int i, struct rubber *r, int rn)
 { int j;
 
   for(j = 0; j <= i; j++)
   { if ( r->where == j && rn )
     { int n;
       for(n=0; n<r->size; n++)
-        Put(r->pad);
+        Sputc(r->pad, fd);
       r++;
       rn--;
     }
     if ( j < i )
-      Put(buf[j]);
+      Sputc(buf[j], fd);
   }
 }

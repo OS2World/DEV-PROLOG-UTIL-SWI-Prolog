@@ -1,13 +1,20 @@
-/*  pl-bag.c,v 1.1.1.1 1992/05/26 11:52:15 jan Exp
+/*  $Id: pl-bag.c,v 1.25 2001/06/14 08:21:56 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: Support predicates for bagof
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
+/*#define O_SECURE 1*/
 #include "pl-incl.h"
+
+#undef LD
+#define LD LOCAL_LD
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 This module defines support  predicates  for  the  Prolog  all-solutions
@@ -21,35 +28,48 @@ The (toplevel) remainder of the all-solutions predicates is  written  in
 Prolog.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-typedef struct assoc * Assoc;
+#define alist LD->bags.bags		/* Each thread has its own */
+					/* storage for this */
 
-struct assoc
-{ Record	key;			/* key binding */
-  Record	value;			/* generator binding */
-  Assoc		next;			/* next in chain */
-};
+typedef struct assoc
+{ Record record;
+  struct assoc *next;
+} *Assoc;
 
-Assoc bags = (Assoc) NULL;		/* chain of value pairs */
 
-forwards word appendBag P((word, word));
-forwards void freeAssoc P((Assoc, Assoc));
+static void
+freeAssoc(Assoc prev, Assoc a)
+{ if ( prev == NULL )
+  { GET_LD
+    alist = a->next;
+  } else
+    prev->next = a->next;
+
+  if ( a->record )
+    freeRecord(a->record);
+
+  freeHeap(a, sizeof(*a));
+}
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-$record_bag(Key, Value)
+$record_bag(Key-Value)
 
 Record a solution of bagof.  Key is a term  v(V0,  ...Vn),  holding  the
-variable biding for solution `Gen'.  Key is ATOM_mark for the mark.
+variable binding for solution `Gen'.  Key is ATOM_mark for the mark.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 word
-pl_record_bag(key, value)
-register Word key, value;
-{ register Assoc a = (Assoc) allocHeap(sizeof(struct assoc));
+pl_record_bag(term_t t)
+{ GET_LD
+  Assoc a = allocHeap(sizeof(*a));
 
-  a->next  = bags;
-  bags = a;
-  a->key   = copyTermToHeap(key);
-  a->value = copyTermToHeap(value);
+  if ( PL_is_atom(t) )
+  { a->record = 0;
+  } else
+    a->record = compileTermToHeap(t, 0);
+
+  a->next    = alist;
+  alist      = a;
 
   succeed;
 }
@@ -59,68 +79,79 @@ This predicate will fail if no more records are left before the mark.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 word
-pl_collect_bag(bindings, bag)
-Word bindings, bag;
-{ word var_term;			/* v() term on global stack */
-  word list = (word) ATOM_nil;		/* result list */
-  register Assoc a, next;
-  Assoc prev = (Assoc) NULL;
+pl_collect_bag(term_t bindings, term_t bag)
+{ GET_LD
+  term_t var_term = PL_new_term_ref();	/* v() term on global stack */
+  term_t list     = PL_new_term_ref();	/* list to construct */
+  term_t binding  = PL_new_term_ref();	/* current binding */
+  term_t tmp      = PL_new_term_ref();
+  Assoc a, next;
+  Assoc prev = NULL;
   
-  if ( (a = bags) == (Assoc) NULL )
+  if ( !(a = alist) )
     fail;
-  if ( !a || a->key->term == (word) ATOM_mark )
+  if ( !a->record )
   { freeAssoc(prev, a);
     fail;				/* trapped the mark */
   }
 
-  var_term = copyTermToGlobal(a->key);	/* get variable term on global stack */
-  list = appendBag(list, copyTermToGlobal(a->value));
+  PL_put_nil(list);
+					/* get variable term on global stack */
+  copyRecordToGlobal(binding, a->record PASS_LD);
+  PL_get_arg(1, binding, var_term);
+  PL_unify(bindings, var_term);
+  PL_get_arg(2, binding, tmp);
+  PL_cons_list(list, tmp, list);
 
   next = a->next;
   freeAssoc(prev, a);  
 
-  if ( next != (Assoc) NULL )
+  if ( next != NULL )
   { for( a = next, next = a->next; next; a = next, next = a->next )
-    { if ( a->key->term == (word) ATOM_mark )
+    { if ( !a->record )
 	break;
-      if ( pl_structural_equal(&var_term, &a->key->term) == FALSE )
+
+      if ( !structuralEqualArg1OfRecord(var_term, a->record PASS_LD) )
       { prev = a;
 	continue;
       }
 
-      list = appendBag(list, copyTermToGlobal(a->value));
+      copyRecordToGlobal(binding, a->record PASS_LD);
+      PL_get_arg(1, binding, tmp);
+      PL_unify(tmp, bindings);
+      PL_get_arg(2, binding, tmp);
+      PL_cons_list(list, tmp, list);
+      SECURE(checkData(valTermRef(list)));
       freeAssoc(prev, a);
     }
   }
 
-  TRY( pl_unify(bindings, &var_term) );
+  SECURE(checkData(valTermRef(var_term)));
 
-  return pl_unify(bag, &list);
+  return PL_unify(bag, list);
 }
 
 
-static
-void
-freeAssoc(prev, a)
-Assoc prev, a;
-{ if ( prev == NULL )
-    bags = a->next;
-  else
-    prev->next = a->next;
-  freeRecord(a->key);
-  freeRecord(a->value);
-  freeHeap(a, sizeof(struct assoc));
-}
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+An exception was generated during  the   execution  of  the generator of
+findall/3, bagof/3 or setof/3. Reclaim  all   records  and  re-throw the
+exception.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+foreign_t
+pl_except_bag(term_t ex)
+{ GET_LD
+  Assoc a, next;
 
-static word
-appendBag(bag, term)
-register word bag;
-register word term;
-{ register word result = globalFunctor(FUNCTOR_dot2);
+  for( a=alist; a; a = next )
+  { if ( a->record )
+    { freeRecord(a->record);
+      next = a->next;
+    } else
+      next = NULL;
 
-  argTerm(result, 0) = term;
-  argTerm(result, 1) = bag;
+    freeHeap(a, sizeof(*a));
+  }
 
-  return result;
+  return PL_raise_exception(ex);
 }

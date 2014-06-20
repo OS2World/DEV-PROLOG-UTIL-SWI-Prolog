@@ -1,13 +1,29 @@
-/*  pl-alloc.c,v 1.3 1993/02/23 13:16:23 jan Exp
+/*  $Id: pl-alloc.c,v 1.68 2001/03/05 13:25:34 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
 
-    Purpose: memory allocation
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #include "pl-incl.h"
+
+#ifndef O_MYALLOC
+#define O_MYALLOC 1
+#endif
+
+#ifndef ALLOC_DEBUG
+#define ALLOC_DEBUG 0
+#endif
+#define ALLOC_MAGIC 0xbf
+#define ALLOC_FREE_MAGIC 0x5f
+#define ALLOC_VIRGIN_MAGIC 0x7f
+
+#if O_MYALLOC
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 This module defines memory allocation for the heap (the  program  space)
@@ -24,25 +40,39 @@ corresponding  unalloc()  call if memory need to be freed.  This saves a
 word to store the size of the memory segment.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+#define LOCK()   PL_LOCK(L_ALLOC)
+#define UNLOCK() PL_UNLOCK(L_ALLOC)
+
 typedef struct chunk *	Chunk;
-typedef long		align_type;
+#ifndef ALIGN_SIZE
+#if defined(__sgi) && !defined(__GNUC__)
+#define ALIGN_SIZE sizeof(double)
+#else
+#define ALIGN_SIZE sizeof(long)
+#endif
+#endif
+#define ALLOC_MIN  sizeof(Chunk)
 
 struct chunk
 { Chunk		next;		/* next of chain */
 };
 
-forwards Chunk	allocate P((alloc_t size));
+typedef struct big_heap
+{ struct big_heap *next;
+  struct big_heap *prev;
+} *BigHeap;
 
-#define ALLOCSIZE	10240	/* size of allocation chunks */
-#define ALLOCFAST	512	/* big enough for all structures */
+static Chunk allocate(size_t size);
+static void *allocBigHeap(size_t size);
+static void  freeBigHeap(void *p);
+static void  freeAllBigHeaps(void);
 
 static char   *spaceptr;	/* alloc: pointer to first free byte */
-static alloc_t spacefree;	/* number of free bytes left */
+static size_t spacefree;	/* number of free bytes left */
 
 static Chunk  freeChains[ALLOCFAST/sizeof(Chunk)+1];
 
-#define ALLOCROUND(n) ( (n) < sizeof(struct chunk) ? sizeof(struct chunk) \
-						   : ROUND(n, sizeof(align_type)) )
+#define ALLOCROUND(n) ROUND(n, ALIGN_SIZE)
 			   
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Allocate n bytes from the heap.  The amount returned is n rounded up to
@@ -55,341 +85,734 @@ The rest of the code uses the macro allocHeap() to access this function
 to avoid problems with 16-bit machines not supporting an ANSI compiler.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-Void
-alloc_heap(n)
-register alloc_t n;
-{ register Chunk f;
-  register alloc_t m;
+void *
+allocHeap(size_t n)
+{ Chunk f;
+  size_t m;
   
-  DEBUG(9, printf("allocated %ld bytes at ", n));
+  if ( n == 0 )
+    return NULL;
+
+  DEBUG(9, Sdprintf("allocated %ld bytes at ", (unsigned long)n));
   n = ALLOCROUND(n);
-  statistics.heap += n;
+  LOCK();
+  GD->statistics.heap += n;
 
   if (n <= ALLOCFAST)
-  { m = n / (int) sizeof(align_type);
-    if ((f = freeChains[m]) != NULL)
+  { m = n / (int) ALIGN_SIZE;
+    if ( (f = freeChains[m]) )
     { freeChains[m] = f->next;
-      f->next = (Chunk) NULL;
-      DEBUG(9, printf("(r) %ld (0x%lx)\n", f, f));
-      return (Word) f;			/* perfect fit */
+      f->next = NULL;
+      DEBUG(9, Sdprintf("(r) %p\n", f));
+#if ALLOC_DEBUG
+      { int i;
+	char *s = (char *) f;
+
+	for(i=sizeof(struct chunk); i<n; i++)
+	  assert(s[i] == ALLOC_FREE_MAGIC);
+
+	memset(f, ALLOC_MAGIC, n);
+      }
+#endif
+      UNLOCK();
+      goto out;
     }
     f = allocate(n);			/* allocate from core */
+    UNLOCK();
 
-    if ((char *)f < hBase) hBase = (char *)f;
-    if ((char *)f > hTop)  hTop  = (char *)f;
+    SetHBase(f);
+    SetHTop((char *)f + n);
 
-    DEBUG(9, printf("(n) %ld (0x%lx)\n", f, f));
-    return f;
+    DEBUG(9, Sdprintf("(n) %p\n", f));
+#if ALLOC_DEBUG
+    memset((char *) f, ALLOC_MAGIC, n);
+#endif
+    goto out;
   }
 
-  f = (Chunk) Malloc(n);
-  DEBUG(9, printf("(b) %ld\n", f));
+  if ( !(f = allocBigHeap(n)) )
+  { UNLOCK();
+    outOfCore();
+  }
+
+  SetHBase(f);
+  SetHTop((char *)f + n);
+
+  UNLOCK();
+
+  DEBUG(9, Sdprintf("(b) %ld\n", (unsigned long)f));
+#if ALLOC_DEBUG
+  memset((char *) f, ALLOC_MAGIC, n);
+#endif
+out:
+
   return f;
 }
 
+
 void
-free_heap(mem, n)
-register Void mem;
-register alloc_t n;
+freeHeap(void *mem, size_t n)
 { Chunk p = (Chunk) mem;
 
+  if ( mem == NULL )
+    return;
+
   n = ALLOCROUND(n);
-  statistics.heap -= n;
-  DEBUG(9, printf("freed %d bytes at %ld\n", n, p));
+#if ALLOC_DEBUG
+  memset((char *) mem, ALLOC_FREE_MAGIC, n);
+#endif
+  LOCK();
+  GD->statistics.heap -= n;
+  DEBUG(9, Sdprintf("freed %ld bytes at %ld\n",
+		    (unsigned long)n, (unsigned long)p));
 
   if (n <= ALLOCFAST)
-  { n /= sizeof(align_type);
+  { n /= ALIGN_SIZE;
     p->next = freeChains[n];
     freeChains[n] = p;
   } else
-  { Free(p);
+  { freeBigHeap(p);
   }
+
+  UNLOCK();
 }
+
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 No perfect fit is available.  We pick memory from the big chunk  we  are
 working  on.   If this is not big enough we will free the remaining part
 of it.  Next we check whether any areas are  assigned  to  be  used  for
 allocation.   If  all  this fails we allocate new core using Allocate(),
-which normally calls Malloc(). Early  versions  of  this  module  called
+which normally calls malloc(). Early  versions  of  this  module  called
 sbrk(),  but  many systems get very upset by using sbrk() in combination
 with other memory allocation functions.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-static
-Chunk
-allocate(n)
-register alloc_t n;
+static Chunk
+allocate(size_t n)
 { char *p;
 
-  if (n <= spacefree)
+  if ( n <= spacefree )
   { p = spaceptr;
+#if ALLOC_DEBUG
+    { int i;
+      char *s = p;
+
+      for(i=0; i<n; i++)
+	assert(s[i] == ALLOC_VIRGIN_MAGIC);
+
+      memset(p, ALLOC_MAGIC, n);
+    }
+#endif
     spaceptr += n;
     spacefree -= n;
     return (Chunk) p;
   }
 
   if ( spacefree >= sizeof(struct chunk) )
-    freeHeap(spaceptr, (alloc_t) (spacefree/sizeof(align_type))*sizeof(align_type));
+  { int m = spacefree/ALIGN_SIZE;
 
-  if ((p = (char *) Allocate(ALLOCSIZE)) <= (char *)NULL)
-    fatalError("Not enough core");
+    if ( m <= (ALLOCFAST/ALIGN_SIZE) )	/* this is freeHeap(), but avoids */
+    { Chunk ch = (Chunk)spaceptr;	/* recursive LOCK() */
+
+#if ALLOC_DEBUG
+      memset(spaceptr, ALLOC_FREE_MAGIC, spacefree);
+#endif
+      ch->next = freeChains[m];
+      freeChains[m] = ch;
+    }
+  }
+
+  if ( !(p = allocBigHeap(ALLOCSIZE)) )
+    outOfCore();
 
   spacefree = ALLOCSIZE;
   spaceptr = p + n;
   spacefree -= n;
 
+#if ALLOC_DEBUG
+  memset(spaceptr, ALLOC_VIRGIN_MAGIC, spacefree);
+  memset(p, ALLOC_MAGIC, n);
+#endif
+
   return (Chunk) p;
 }
+
+
+void
+initMemAlloc()
+{ static int done = FALSE;
+
+  PL_LOCK(L_INIT_ALLOC);		/* avoid recursive lock */
+  if ( !done )
+  { Word hbase;
+
+    done = TRUE;
+
+    assert(ALIGN_SIZE >= ALLOC_MIN);
+    hBase = (char *)(~0L);
+    hTop  = (char *)NULL;
+    hbase = allocHeap(sizeof(word));
+    *hbase = 0;
+    heap_base = (ulong)hbase & ~0x007fffffL; /* 8MB */
+    freeHeap(hbase, sizeof(word));
+  }
+  PL_UNLOCK(L_INIT_ALLOC);
+}
+
+
+void
+cleanupMemAlloc(void)
+{ freeAllBigHeaps();
+
+  memset(freeChains, 0, sizeof(freeChains));
+  spacefree = 0;
+  spaceptr = NULL;
+}
+
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Deal with big allocHeap() calls. We have   comitted ourselves to be able
+to free all memory we have allocated, so   we  must know the pointers we
+have allocated. Normally big chunks are rather infrequent, but there can
+be a lot if the program uses lots of big clauses, records or atoms.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static BigHeap big_heaps;
+
+static void *
+allocBigHeap(size_t size)
+{ BigHeap h = malloc(size+sizeof(*h));
+
+  if ( !h )
+    return NULL;
+  
+  h->next = big_heaps;
+  h->prev = NULL;
+  if ( big_heaps )
+    big_heaps->prev = h;
+  big_heaps = h;
+
+  return (void *)(h+1);
+}
+
+
+static void
+freeBigHeap(void *p)
+{ BigHeap h = p;
+  
+  h--;					/* get the base */
+  if ( h->prev )
+    h->prev->next = h->next;
+  else
+    big_heaps = h->next;
+  if ( h->next )
+    h->next->prev = h->prev;
+
+  free(h);
+}
+
+
+static void
+freeAllBigHeaps(void)
+{ BigHeap h, next;
+
+  for(h=big_heaps; h; h=next)
+  { next = h->next;
+    free(h);
+  }
+  big_heaps = NULL;
+}
+
+#else /*O_MYALLOC*/
+
+void *
+allocHeap(size_t n)
+{ if ( n )
+  { void *mem = malloc(n);
+
+    if ( !mem )
+      outOfCore();
+    
+    GD->statistics.heap += n;
+    SetHBase(mem);
+    SetHTop((char *)mem + n);
+
+    return mem;
+  }
+
+  return NULL;
+}
+
+
+void
+freeHeap(void *mem, size_t n)
+{
+#if ALLOC_DEBUG
+  memset((char *) mem, ALLOC_FREE_MAGIC, n);
+#endif
+
+  free(mem);
+  GD->statistics.heap -= n;
+}
+
+
+void
+initMemAlloc()
+{ static int done = FALSE;
+
+  PL_LOCK(L_INIT_ALLOC);		/* avoid recursive lock */
+  if ( !done )
+  { void *hbase;
+
+    done = TRUE;
+
+    hBase = (char *)(~0L);
+    hTop  = (char *)NULL;
+    hbase = allocHeap(sizeof(word));
+    heap_base = (ulong)hbase & ~0x007fffffL; /* 8MB */
+    freeHeap(hbase, sizeof(word));
+  }
+  PL_UNLOCK(L_INIT_ALLOC);
+}
+
+
+void
+cleanupMemAlloc(void)
+{ 					/* TBD: Cleanup! */
+}
+
+#endif /*O_MYALLOC*/
+
 
 		/********************************
 		*             STACKS            *
 		*********************************/
 
-volatile void
-outOf(s)
-Stack s;
-{ warning("Out of %s stack", s->name);
+void
+outOfStack(Stack s, int how)
+{ LD->trim_stack_requested = TRUE;
 
-  pl_abort();
+  switch(how)
+  { case STACK_OVERFLOW_FATAL:
+      LD->outofstack = s;
+      warning("Out of %s stack", s->name);
+
+      pl_abort(ABORT_FATAL);
+      assert(0);
+    case STACK_OVERFLOW_SIGNAL_IMMEDIATELY:
+      LD->outofstack = NULL;
+      gc_status.requested = FALSE;	/* can't have that */
+      PL_unify_term(LD->exception.tmp,
+		    PL_FUNCTOR, FUNCTOR_error2,
+		      PL_FUNCTOR, FUNCTOR_resource_error1,
+		        PL_ATOM, ATOM_stack,
+		      PL_CHARS, s->name);
+      PL_throw(LD->exception.tmp);
+      warning("Out of %s stack while not in Prolog!?", s->name);
+      assert(0);
+    case STACK_OVERFLOW_SIGNAL:
+      LD->outofstack = s;
+  }
 }
+
+
+volatile void
+outOfCore()
+{ fatalError("Could not allocate memory: %s", OsError());
+}
+
+		 /*******************************
+		 *	REFS AND POINTERS	*
+		 *******************************/
+
+#undef LD
+#define LD LOCAL_LD
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+__consPtr() is inlined for this module (including pl-wam.c), but external
+for the other modules, where it is far less fime-critical.
+
+Actually, for normal operation, consPtr() is a macro from pl-data.h
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#if !defined(consPtr) || defined(SECURE_GC) || defined(_DEBUG)
+#undef consPtr
+
+static inline word
+__consPtr(void *p, int ts)
+{
+  GET_LD
+  unsigned long v = (unsigned long) p;
+
+  v -= base_addresses[ts&STG_MASK];
+  assert(v < MAXTAGGEDPTR);
+  return (v<<5)|ts;
+}
+
+word
+consPtr(void *p, int ts)
+{ return __consPtr(p, ts);
+}
+
+#define consPtr(p, s) __consPtr(p, s)
+#endif
+
+#define makeRefL(p) consPtr(p, TAG_REFERENCE|STG_LOCAL)
+#define makeRefG(p) consPtr(p, TAG_REFERENCE|STG_GLOBAL)
+
+static inline word
+__makeRef(Word p ARG_LD)
+{ if ( p >= (Word) lBase )
+    return makeRefL(p);
+  else
+    return makeRefG(p);
+}
+
+
+word
+makeRef(Word p)
+{ GET_LD
+  return __makeRef(p PASS_LD);		/* public version */
+}
+
+#define makeRef(p)  __makeRef(p PASS_LD)
+
 
 		/********************************
 		*        GLOBAL STACK           *
 		*********************************/
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-alloc_global() allocates on the global stack.  Many  functions  do  this
-inline  as  it is simple and usualy very time critical.  The rest of the
-system should call the macro allocGlobal() to ensure the type  is  right
-on 16-bit machines not supporting ANSI.
+allocGlobal() allocates on the global stack.  Many  functions  do  this
+inline  as  it is simple and usualy very time critical.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-Void
-alloc_global(n)
-register alloc_t n;
-{ register Word result = gTop;
+#if O_SHIFT_STACKS
+Word
+allocGlobal(int n)
+{ GET_LD
+  Word result;
 
-  gTop += (n + sizeof(word)-1) / sizeof(word);
-  verifyStack(global);
+  if ( roomStack(global)/sizeof(word) < (long) n )
+  { growStacks(NULL, NULL, NULL, FALSE, TRUE, FALSE);
+
+    if ( roomStack(global)/sizeof(word) < (long) n )
+      outOfStack((Stack) &LD->stacks.global, STACK_OVERFLOW_FATAL);
+  }
+
+  result = gTop;
+  gTop += n;
 
   return result;
 }
 
-word
-globalFunctor(def)
-register FunctorDef def;
-{ register Functor f = (Functor) gTop;
-  register int arity = def->arity;
-  register Word a;
+#else
 
-  gTop = (Word)((char *)gTop + sizeof(FunctorDef) + sizeof(word) * arity);
-  verifyStack(global);
-  f->definition = def;
-  for(a = argTermP(f, 0); arity > 0; a++, arity--)
-    setVar(*a);
+static inline Word
+__allocGlobal(int n)
+{ GET_LD
+  Word result = gTop;
 
-  return (word) f;
+  requireStack(global, n * sizeof(word));
+  gTop += n;
+
+  return result;
 }
 
-#if O_STRING
-word
-globalString(s)
-register char *s;
-{ register ulong l = strlen(s) + 1;
-  register Word gt = gTop;
-  register long chars = ROUND(l, sizeof(word));
-
-  gTop = (Word) addPointer(gTop, 2*sizeof(word) + chars);
-  verifyStack(global);
-  gt[0] = gt[1+chars/sizeof(word)] = (((l-1)<<LMASK_BITS) | STRING_MASK);
-  strcpy((char *)(gt+1), s);
-
-  return ((word)gt | INDIRECT_MASK);
+Word allocGlobal(int n)
+{ return __allocGlobal(n);
 }
 
+#define allocGlobal(n) __allocGlobal(n)
+
+#endif
+
 word
-heapString(s)
-char *s;
-{ ulong l = strlen(s) + 1;
-  register long chars = ROUND(l, sizeof(word));
-  Word gt = (Word)allocHeap(2*sizeof(word) + chars);
+globalFunctor(functor_t f)
+{ GET_LD
+  int arity = arityFunctor(f);
+  Word a = allocGlobal(1 + arity);
+  Word t = a;
 
-  gt[0] = gt[1+chars/sizeof(word)] = (((l-1)<<LMASK_BITS) | STRING_MASK);
-  strcpy((char *)(gt+1), s);
+  *a = f;
+  while( --arity >= 0 )
+    setVar(*++a);
 
-  return (word)gt | INDIRECT_MASK;
+  return consPtr(t, TAG_COMPOUND|STG_GLOBAL);
 }
 
-#endif /* O_STRING */
+
+Word
+newTerm(void)
+{ Word t = allocGlobal(1);
+
+  setVar(*t);
+
+  return t;
+}
+
+		 /*******************************
+		 *      OPERATIONS ON LONGS	*
+		 *******************************/
+
+word
+globalLong(long l)
+{ GET_LD
+  Word p = allocGlobal(3);
+  word r = consPtr(p, TAG_INTEGER|STG_GLOBAL);
+  word m = mkIndHdr(1, TAG_INTEGER);
+
+  *p++ = m;
+  *p++ = l;
+  *p   = m;
+  
+  return r;
+}
+
+
+		 /*******************************
+		 *    OPERATIONS ON STRINGS	*
+		 *******************************/
+
+int
+sizeString(word w)
+{ GET_LD
+  word m  = *((Word)addressIndirect(w));
+  int wn  = wsizeofInd(m);
+  int pad = padHdr(m);
+
+  return wn*sizeof(word) - pad;
+}
+
+
+word
+globalNString(long l, const char *s)
+{ GET_LD
+  int lw = (l+sizeof(word))/sizeof(word);
+  int pad = (lw*sizeof(word) - l);
+  Word p = allocGlobal(2 + lw);
+  word r = consPtr(p, TAG_STRING|STG_GLOBAL);
+  word m = mkStrHdr(lw, pad);
+
+  *p++ = m;
+  p[lw-1] = 0L;				/* write zero's for padding */
+  memcpy(p, s, l);
+  p += lw;
+  *p = m;
+  
+  return r;
+}
+
+
+word
+globalString(const char *s)
+{ return globalNString(strlen(s), s);
+}
+
+
+
+		 /*******************************
+		 *     OPERATIONS ON DOUBLES	*
+		 *******************************/
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-To allow for garbage collection,  reals  are  packed  into  two  tagged
-words.   The  4  top  bits  are  REAL_MASK  and the two bottom bits are
-reserved for garbage collection.  This leaves us with 52 bits  to  store
-the  real.   As  a  consequence,  SWI-Prolog  now uses a kind of `small
-doubles', increasing arithmetic accuracy.
-
-This code is very hacky and needs to be rewritten for  systems  that  do
-not  have  IEEE  floating  point format.  Luckily almost all systems use
-IEEE these days.
-
-Fixed for GCC 2.2 with the help of Giovanni Malnati.
+Storage of floats (doubles) on the  stacks   and  heap.  Such values are
+packed into two `guards words'.  An   intermediate  structure is used to
+ensure the possibility of  word-aligned  copy   of  the  data. Structure
+assignment is used here  to  avoid  a   loop  for  different  values  of
+WORDS_PER_DOUBLE.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-typedef union
-{ real f;
-  struct
-  { ulong e;
-    ulong f;
-  } bits;
-} fconvert;
+typedef struct
+{ word w[WORDS_PER_DOUBLE];
+} fword;
 
-forwards void	pack_real P((real f, fconvert *r));
-
-#define IEEE 1
-
-#if IEEE
-static void
-pack_real(f, r)
-real f;
-register fconvert *r;
-{ fconvert b;
-
-  b.f = f;
-  b.bits.f >>= 10;
-  b.bits.f &= ~0xffc00003L;
-  b.bits.f |= (b.bits.e & 0x3f) << 22;
-  b.bits.e >>= 4;
-  b.bits.e &= ~0xf0000003L;
-#if O_16_BITS
-  b.bits.e >>= 1;
-  b.bits.f >>= 1;
-#endif
-  b.bits.f |= REAL_MASK;
-  b.bits.e |= REAL_MASK;
-
-  (*r).bits = b.bits;
-}
-
-double
-unpack_real(p)
-Word p;
-{ fconvert b;
-
-  b.bits = ((fconvert *)p)->bits;
-
-#if O_16_BITS
-  b.bits.e <<= 1;
-  b.bits.f <<= 1;
-#endif
-  b.bits.e <<= 4;
-  b.bits.e &= ~0x0000003fL;
-  b.bits.e |= (b.bits.f & 0x0fc00000L) >> 22;
-  b.bits.f <<= 10;
-  b.bits.f &= ~0x000003ffL;
-
-  return b.f;
-}
-#endif /* IEEE */
 
 void
-setReal(w, f)
-word w;
-real f;
-{ fconvert *b = (fconvert *)unMask(w);
-  pack_real(f, b);
+doublecpy(void *to, void *from)
+{ fword *t = to;
+  fword *f = from;
+
+  *t = *f;
 }
+
+
+double					/* take care of alignment! */
+valReal(word w)
+{ GET_LD
+  fword *v = (fword *)valIndirectP(w);
+  union
+  { double d;
+    fword  l;
+  } val;
+  
+  val.l = *v;
+
+  return val.d;
+}
+
 
 word
-globalReal(f)
-real f;
-{ fconvert *b = (fconvert *)gTop;
+globalReal(double d)
+{ GET_LD
+  Word p = allocGlobal(2+WORDS_PER_DOUBLE);
+  word r = consPtr(p, TAG_FLOAT|STG_GLOBAL);
+  word m = mkIndHdr(WORDS_PER_DOUBLE, TAG_FLOAT);
+  union
+  { double d;
+    fword  l;
+  } val;
+  fword *v;
 
-  gTop += sizeof(fconvert) / sizeof(word);
-  verifyStack(global);
-  pack_real(f, b);
+  val.d = d;
+  *p++ = m;
+  v = (fword *)p;
+  *v++ = val.l;
+  p = (Word) v;
+  *p   = m;
 
-  DEBUG(4, printf("Put REAL on global stack at 0x%x\n", b));
-  return (word)b | INDIRECT_MASK;
+  return r;
 }
 
-word
-heapReal(f)
-real f;
-{ fconvert *b = (fconvert *)allocHeap(sizeof(fconvert));
 
-  pack_real(f, b);
-  return (word)b | INDIRECT_MASK;
-}
+		 /*******************************
+		 *  GENERIC INDIRECT OPERATIONS	*
+		 *******************************/
 
+int
+equalIndirect(word w1, word w2)
+{ GET_LD
+  Word p1 = addressIndirect(w1);
+  Word p2 = addressIndirect(w2);
+  
+  if ( *p1 == *p2 )
+  { int n = wsizeofInd(*p1);
+    
+    while( --n >= 0 )
+    { if ( *++p1 != *++p2 )
+	fail;
+    }
 
-		/********************************
-		*         LOCAL STACK           *
-		*********************************/
-
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Allocation on the local stack is used by many foreign language functions
-that needs scratch memory.  The area normally is large and it  need  not
-be  deallocated  as  it  vanishes  after  quiting  the  foreign language
-function anyway.
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-static char *scratchBase;			/* base for scratching */
-#if !O_DYNAMIC_STACKS
-static char *scratchTop;
-#endif
-
-void
-initAllocLocal()
-{ if (scratchBase == (char *)NULL)
-  { scratchBase = (char *) lTop;
-#if !O_DYNAMIC_STACKS
-    scratchTop  = (char *) lMax;
-#endif
+    succeed;
   }
+
+  fail;
 }
 
-Void
-alloc_local(n)
-register alloc_t n;
-{ register char *mem = scratchBase;
 
-  scratchBase += ROUND(n, sizeof(word));
-#if !O_DYNAMIC_STACKS
-  STACKVERIFY( if ( scratchBase >= scratchTop )
-		 outOf((Stack) &stacks.local) );
-#endif
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Copy an indirect data object to the heap.  The type is not of importance,
+neither is the length or original location.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-  return mem;
+word
+globalIndirect(word w)
+{ GET_LD
+  Word p = addressIndirect(w);
+  word t = *p;
+  int  n = wsizeofInd(t);
+  Word h = allocGlobal((n+2));
+  Word hp = h;
+  
+  *hp = t;
+  while(--n >= 0)
+    *++hp = *++p;
+  *++hp = t;
+
+  return consPtr(h, tag(w)|STG_GLOBAL);
 }
 
-void
-stopAllocLocal()
-{ scratchBase = (char *)NULL;
+
+word
+globalIndirectFromCode(Code *PC)
+{ GET_LD
+  Code pc = *PC;
+  word m = *pc++;
+  int  n = wsizeofInd(m);
+  Word p = allocGlobal(n+2);
+  word r = consPtr(p, tag(m)|STG_GLOBAL);
+
+  *p++ = m;
+  while(--n >= 0)
+    *p++ = *pc++;
+  *p++ = m;
+
+  *PC = pc;
+  return r;
 }
 
-char *
-store_string_local(s)
-register char *s;
-{ register char *copy = (char *)allocLocal(strlen(s)+1);
 
-  strcpy(copy, s);
-  return copy;
+static int				/* used in pl-wam.c */
+equalIndirectFromCode(word a, Code *PC)
+{ GET_LD
+  Word pc = *PC;
+  Word pa = addressIndirect(a);
+
+  if ( *pc == *pa )
+  { int  n = wsizeofInd(*pc);
+
+    while(--n >= 0)
+    { if ( *++pc != *++pa )
+	fail;
+    }
+    pc++;
+    *PC = pc;
+    succeed;
+  }
+
+  fail;
 }
+
 
 		/********************************
 		*            STRINGS            *
 		*********************************/
 
+
+#ifdef O_DEBUG
+#define CHAR_INUSE 0x42
+#define CHAR_FREED 0x41
+
 char *
-store_string(s)
-char *s;
+store_string(const char *s)
+{ char *copy = (char *)allocHeap(strlen(s)+2);
+
+  *copy++ = CHAR_INUSE;
+  strcpy(copy, s);
+
+  return copy;
+}
+
+
+void
+remove_string(char *s)
+{ if ( s )
+  { assert(s[-1] == CHAR_INUSE);
+    
+    s[-1] = CHAR_FREED;
+    freeHeap(s-1, strlen(s)+2);
+  }
+}
+
+#else /*O_DEBUG*/
+
+char *
+store_string(const char *s)
 { char *copy = (char *)allocHeap(strlen(s)+1);
 
   strcpy(copy, s);
   return copy;
 }
+
+
+void
+remove_string(char *s)
+{ if ( s )
+    freeHeap(s, strlen(s)+1);
+}
+
+#endif /*O_DEBUG*/
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 Hash function for strings.  This function has been evaluated on Shelley,
@@ -398,14 +821,61 @@ distribution over these atoms.  Note that size equals 2^n.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 int
-stringHashValue(s, size)
-register char *s;
-register int size;
-{ register int value = 0;
-  register int shift = 0;
+unboundStringHashValue(const char *t, unsigned int len)
+{ unsigned int value = 0;
+  unsigned int shift = 5;
 
-  while(*s)
-    value += (((int)(*s++)) << ((++shift) & 0x7));
+  while(len-- != 0)
+  { unsigned int c = *t++;
+    
+    c -= 'a';
+    value ^= c << (shift & 0xf);
+    shift ^= c;
+  }
 
-  return value & (size-1);
+  return value ^ (value >> 16);
 }
+
+
+		 /*******************************
+		 *	     GNU MALLOC		*
+		 *******************************/
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+These functions are used by various GNU-libraries and -when not linked
+with the GNU C-library lead to undefined symbols.  Therefore we define
+them in SWI-Prolog so that we can also give consistent warnings.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+#ifndef xmalloc				/* for use with dmalloc */
+
+void *
+xmalloc(size_t size)
+{ void *mem;
+
+  if ( (mem = malloc(size)) )
+    return mem;
+  if ( size )
+    outOfCore();
+
+  return NULL;
+}
+
+
+void *
+xrealloc(void *mem, size_t size)
+{ void *newmem;
+
+  newmem = mem ? realloc(mem, size) : malloc(size);
+  if ( newmem )
+    return newmem;
+  if ( size )
+    outOfCore();
+
+  return NULL;
+}
+
+#endif /*xmalloc*/
+
+#undef LOCK
+#undef UNLOCK

@@ -1,4 +1,4 @@
-/*  check.pl,v 1.1.1.1 1992/05/26 11:51:35 jan Exp
+/*  $Id: check.pl,v 1.4 1999/11/04 10:02:39 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -42,9 +42,12 @@ list_undefined_ :-
 	\+ predicate_property(Module:Head, imported_from(_)), 
 	functor(Head, Functor, Arity), 
 	\+ $in_library(Functor, Arity),
+	\+ system_undefined(Module:Functor/Arity),
 	write_undefined(Module:Functor/Arity), 
 	fail.
 list_undefined_.
+
+system_undefined(user:prolog_trace_interception/4).
 
 write_undefined(user:Name/Arity) :- !, 
 	format('~w/~w~n', [Name, Arity]).
@@ -57,9 +60,10 @@ write_undefined(Module:Name/Arity) :-
 list_autoload :-
 	$style_check(Old, Old), 
 	style_check(+dollar), 
-	please(autoload, OldAutoLoad, off),
+	current_prolog_flag(autoload, OldAutoLoad),
+	set_prolog_flag(autoload, false),
 	list_autoload_, 
-	please(autoload, _, OldAutoLoad),
+	set_prolog_flag(autoload, OldAutoLoad),
 	$style_check(_, Old).
 	
 list_autoload_ :-

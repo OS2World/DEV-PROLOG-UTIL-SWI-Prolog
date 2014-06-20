@@ -1,238 +1,182 @@
-/*  pl-sys.c,v 1.2 1993/02/23 13:16:47 jan Exp
+/*  $Id: pl-sys.c,v 1.24 2000/02/17 11:56:23 jan Exp $
 
-    Copyright (c) 1990 Jan Wielemaker. All rights reserved.
-    See ../LICENCE to find out about your rights.
-    jan@swi.psy.uva.nl
+    Part of SWI-Prolog
+
+    Author:  Jan Wielemaker
+    E-mail:  jan@swi.psy.uva.nl
+    WWW:     http://www.swi.psy.uva.nl/projects/SWI-Prolog/
+    Copying: GPL-2.  See the file COPYING or http://www.gnu.org
+
+    Copyright (C) 1990-2000 SWI, University of Amsterdam. All rights reserved.
 */
 
 #include "pl-incl.h"
 
+#ifdef HAVE_FTIME
+#include <sys/timeb.h>
+#endif
+
+#ifndef MAXVARNAME
+#define MAXVARNAME 1024
+#endif
+
 word
-pl_shell(command, status)
-Word command, status;
-{ char *cmd = primitiveToString(*command, FALSE);
+pl_shell(term_t command, term_t status)
+{ char *cmd;
 
-  if ( cmd == (char *) NULL )
-    return warning("shell/1: instantiation fault");
+  if ( PL_get_chars(command, &cmd, CVT_ALL) )
+  { int rval = System(cmd);
 
-  return unifyAtomic(status, consNum(System(cmd)) );
+    return PL_unify_integer(status, rval);
+  }
+  
+  return warning("shell/1: instantiation fault");
 }
 
-word
-pl_getenv(var, value)
-Word var, value;
-{ char *n, *v;
-
-  if ( (n = primitiveToString(*var, FALSE)) == (char *) NULL )
-    return warning("getenv/2: instantiation fault");
-
-  if ((v = getenv(n)) == (char *) NULL)
-    fail;
-
-  return unifyAtomic(value, lookupAtom(v));
-}  
 
 word
-pl_setenv(var, value)
-Word var, value;
-{ char *n, *v;
-
-  initAllocLocal();
-  n = primitiveToString(*var, TRUE);
-  v = primitiveToString(*value, TRUE);
-  stopAllocLocal();
-
-  if ( n == (char *)NULL || v == (char *) NULL )
-    return warning("setenv/2: instantiation fault");
-
-  Setenv(n, v);
-
-  succeed;
-}
-
-word
-pl_unsetenv(var)
-Word var;
+pl_getenv(term_t var, term_t value)
 { char *n;
 
-  if ( (n = primitiveToString(*var, FALSE)) == (char *) NULL )
-    return warning("unsetenv/1: instantiation fault");
+  if ( PL_get_chars(var, &n, CVT_ALL) )
+  { int len = getenvl(n);
 
-  Unsetenv(n);
+    if ( len >= 0 )
+    { char *buf	= alloca(len+1);
+      
+      if ( buf )
+      { char *s;
 
-  succeed;
-}
+	if ( (s=getenv3(n, buf, len+1)) )
+	  return PL_unify_atom_chars(value, s);
+      } else
+	return PL_error("getenv", 2, NULL, ERR_NOMEM);
+    }
+
+    fail;
+  }
+
+  return warning("getenv/2: instantiation fault");
+}  
+
 
 word
-pl_argv(list)
-Word list;
-{ int n;
-  word w;
+pl_setenv(term_t var, term_t value)
+{ char *n, *v;
 
-  for(n=0; n<mainArgc; n++)
-  { w = (word) lookupAtom(mainArgv[n]);
-    APPENDLIST(list, &w);
-  }
-  CLOSELIST(list);
-
-  succeed;
-}
-
-#if LINK_THIEF
-#define	POSTFIX	0
-#define	PREFIX	1
-#define	INFIX	2
-
-int
-GetOp(token, type, lhs, op, rhs)
-char *token;
-int type, *lhs, *op, *rhs;
-{ Atom name = lookupAtom(token);
-  int subtype;
-
-  switch(type)
-  { case PREFIX:
-	if ( isPrefixOperator(name, &subtype, op) )
-	{ *lhs = *rhs = (subtype == OP_FX ? *op - 1 : *op);
-	  succeed;
-	}
-	fail;
-    case POSTFIX:
-	if ( isPostfixOperator(name, &subtype, op) )
-	{ *lhs = *rhs = (subtype == OP_XF ? *op - 1 : *op);
-	  succeed;
-	}
-	fail;
-    case INFIX:
-	if ( isInfixOperator(name, &subtype, op) )
-	{ *lhs = (subtype == OP_XFY || subtype == OP_XFX ? *op - 1 : *op);
-	  *rhs = (subtype == OP_XFX || subtype == OP_YFX ? *op - 1 : *op);
-	  succeed;
-	}
-	fail;
-  }
-  return fatalError("Unknown operator type request from thief: %d", type);
-}
-
-word
-pl_thief(args)
-Word args;
-{ int argc = 0;
-  char *argv[50];
-  extern int thief();
-
-  argv[argc++] = "top";
-
-  while( isList(*args) )
-  { Word a = argTermP(*args, 0);
-    deRef(a);
-    if ( !isAtom(*a) )
-      return warning("thief/1: illegal argument list");
-    argv[argc++] = stringAtom(*a);
-    args = argTermP(*args, 1);
-    deRef(args);
-  }
-  if ( !isNil(*args) )
-    return warning("thief/1: illegal argument list");
-
-  if ( thief(argc, argv) == 0 )
+  if ( PL_get_chars(var, &n, CVT_ALL|BUF_RING) &&
+       PL_get_chars(value, &v, CVT_ALL) )
+  { Setenv(n, v);
     succeed;
-  fail;
-}
-#endif /* LINK_THIEF */
-
-word
-pl_grep(file, search, line, h)
-Word file, search, line;
-word h;
-{ char *fn;
-  FILE *fd;
-
-  switch( ForeignControl(h) )
-  { case FRG_FIRST_CALL:
-      { if ( (fn = primitiveToString(*file, FALSE)) == (char *) NULL )
-	  return warning("$grep/3: instantiation fault");
-	if ( (fn = ExpandOneFile(fn)) == (char *)NULL )
-	  fail;
-	if ( (fd = Fopen(fn, "r")) == (FILE *) NULL )
-	  return warning("$grep/3: cannot open %s: %s", fn, OsError());
-      }
-      goto redo;
-    case FRG_REDO:
-      { char buf[1024];
-	char *s;
-
-	fd = (FILE *) ForeignContextAddress(h);
-      redo:
-	if ( (s = primitiveToString(*search, FALSE)) == (char *) NULL )
-	  return warning("$grep/3: instantiation fault");
-	while( fgets(buf, 1023, fd) != (char *) NULL )
-	{ if ( (*s == '^' && strprefix(buf, &s[1])) ||
-	       strsub(buf, s) )
-	  { for( s = buf; *s; s++ )	/* get rid of final newline */
-	    { if ( *s == '\n' )
-	      { *s = EOS;
-	        break;
-	      }
-	    }	      
-
-	    if ( unifyAtomic(line, globalString(buf)) == FALSE )
-	      continue;
-
-	    ForeignRedo(fd);
-	  }
-	}         
-	fclose(fd);
-
-	fail;
-      }
-    case FRG_CUTTED:
-    default:;
-	fclose((FILE *)ForeignContextAddress(h));
-	succeed;
   }
+
+  return warning("setenv/2: instantiation fault");
 }
 
+
 word
-pl_convert_time(time, year, month, day, hour, minute, second, usec)
-Word time, year, month, day, hour, minute, second, usec;
-{ if ( isReal(*time) )
-  { double tf = valReal(*time);
-    long t    = (long) tf;
+pl_unsetenv(term_t var)
+{ char *n;
+
+  if ( PL_get_chars(var, &n, CVT_ALL) )
+  { Unsetenv(n);
+
+    succeed;
+  }
+
+  return warning("unsetenv/1: instantiation fault");
+}
+
+
+word
+pl_convert_time(term_t time, term_t year, term_t month,
+		term_t day, term_t hour, term_t minute,
+		term_t second, term_t usec)
+{ double tf;
+
+  if ( PL_get_float(time, &tf) && tf <= PLMAXINT && tf >= PLMININT )
+  { long t    = (long) tf;
     long us   = (long)((tf - (double) t) * 1000.0);
     struct tm *tm = LocalTime(&t);
 
-    TRY(unifyAtomic(year, 	consNum(tm->tm_year + 1900) ));
-    TRY(unifyAtomic(month, 	consNum(tm->tm_mon + 1) ));
-    TRY(unifyAtomic(day, 	consNum(tm->tm_mday) ));
-    TRY(unifyAtomic(hour, 	consNum(tm->tm_hour) ));
-    TRY(unifyAtomic(minute, 	consNum(tm->tm_min) ));
-    TRY(unifyAtomic(second, 	consNum(tm->tm_sec) ));
-    TRY(unifyAtomic(usec, 	consNum(us) ));
-    succeed;
-  } else
-    return warning("convert_time/8: instantiation fault");
+    if ( PL_unify_integer(year,   tm->tm_year + 1900) &&
+	 PL_unify_integer(month,  tm->tm_mon + 1) &&
+	 PL_unify_integer(day,    tm->tm_mday) &&
+	 PL_unify_integer(hour,   tm->tm_hour) &&
+	 PL_unify_integer(minute, tm->tm_min) &&
+	 PL_unify_integer(second, tm->tm_sec) &&
+	 PL_unify_integer(usec,   us) )
+      succeed;
+    else
+      fail;
+  }
+
+  return PL_error("convert_time", 8, NULL, ERR_TYPE, ATOM_time_stamp, time);
 }
 
+
 word
-pl_get_time(t)
-Word t;
-{ struct timeval tp;
-  real time;
+pl_convert_time2(term_t time, term_t string)
+{ double tf;
+
+  if ( PL_get_float(time, &tf) && tf <= PLMAXINT && tf >= PLMININT )
+  { time_t t  = (time_t)(long)tf;
+    char *s = ctime(&t);
+
+    if ( s )
+    { char *e = s + strlen(s);
+      while(e>s && e[-1] == '\n')
+	e--;
+      *e = EOS;
+
+      return PL_unify_string_chars(string, s);
+    }
+
+    return warning("convert_time/2: %s", OsError());
+  }
+  
+  return PL_error("convert_time", 2, NULL, ERR_TYPE, ATOM_time_stamp, time);
+}
+
+
+word
+pl_get_time(term_t t)
+{ double stime;
+#ifdef HAVE_GETTIMEOFDAY
+  struct timeval tp;
 
   gettimeofday(&tp, NULL);
-  time = (real)tp.tv_sec + (real)tp.tv_usec/1000000.0;
-  
-  return unifyAtomic(t, globalReal(time));
+  stime = (double)tp.tv_sec + (double)tp.tv_usec/1000000.0;
+#else
+#ifdef HAVE_FTIME
+  struct timeb tb;
+
+  ftime(&tb);
+  stime = (double)tb.time + (double)tb.millitm/1000.0;
+#else
+  stime = (double)time((time_t *)NULL);
+#endif
+#endif
+
+  return PL_unify_float(t, stime);
 }
 
-word
-pl_sleep(time)
-Word time;
-{ real t;
 
-  TRY( wordToReal(*time, &t) );
-  Sleep(t);
+word
+pl_sleep(term_t time)
+{ double t;
+
+  if ( PL_get_float(time, &t) )
+    Pause(t);
   
   succeed;
+}
+
+#ifdef __WIN32__
+#include <process.h>
+#endif
+
+word
+pl_get_pid(term_t pid)
+{ return PL_unify_integer(pid, getpid());
 }

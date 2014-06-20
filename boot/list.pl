@@ -1,4 +1,4 @@
-/*  list.pl,v 1.1.1.1 1992/05/26 11:51:22 jan Exp
+/*  $Id: list.pl,v 1.6 1999/05/05 13:47:15 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -8,7 +8,6 @@
 
 :- module($list,
 	[ length/2
-	, select/3
 	, delete/3
 	, nth0/3
 	, nth1/3
@@ -37,13 +36,6 @@ length2([_|List], N) :-
 	length2(List, M), 
 	succ(M, N).
 
-%	select(?List1, ?Elem, ?List2)
-%	Is true when List1, with Elem removed results in List2.
-
-select([X|Tail], X, Tail).
-select([Head|Tail], Elem, [Head|Rest]) :-
-	select(Tail, Elem, Rest).
-
 %	delete(?List1, ?Elem, ?List2)
 %	Is true when Lis1, with all occurences of Elem deleted results in
 %	List2.
@@ -54,46 +46,61 @@ delete([Elem|Tail], Elem, Result) :- !,
 delete([Head|Tail], Elem, [Head|Rest]) :-
 	delete(Tail, Elem, Rest).
 
-%	nth0(?Index, ?List, ?Elem)
-%	Is true when Elem is the Index'th element of List. Counting starts
-%	at 0.
+/*  nth0/3, nth1/3 are improved versions from
+    Martin Jansche <martin@pc03.idf.uni-heidelberg.de>
+*/
+
+%%  nth0(?Index, ?List, ?Elem)
+%%  is true when Elem is the Index'th element of List.  Counting starts
+%%  at 0.  [This is a faster version of the original SWI-Prolog predicate.]
 
 nth0(Index, List, Elem) :-
-	integer(Index), !,
-	nth0_1(Index, List, Elem).
+        integer(Index), !,
+        Index >= 0,
+        nth0_det(Index, List, Elem).    %% take nth deterministically
 nth0(Index, List, Elem) :-
-	var(Index), !,
-	nth0_2(Index, List, Elem).
+        var(Index), !,
+        nth_gen(List, Elem, 0, Index).  %% match
 
-nth0_1(0, [Elem|_], Elem) :- !.		% take nth deterministically
-nth0_1(N, [_|Tail], Elem) :-
-	M is N - 1,
-	nth0(M, Tail, Elem).
+nth0_det(0, [Elem|_], Elem) :- !.
+nth0_det(1, [_,Elem|_], Elem) :- !.
+nth0_det(2, [_,_,Elem|_], Elem) :- !.
+nth0_det(3, [_,_,_,Elem|_], Elem) :- !.
+nth0_det(4, [_,_,_,_,Elem|_], Elem) :- !.
+nth0_det(5, [_,_,_,_,_,Elem|_], Elem) :- !.
+nth0_det(N, [_,_,_,_,_,_   |Tail], Elem) :-
+        M is N - 6,
+        nth0_det(M, Tail, Elem).
 
-nth0_2(0, [Elem|_], Elem).		% match
-nth0_2(N, [_|Tail], Elem) :-
-	nth0_2(M, Tail, Elem), 
-	succ(M, N).
+nth_gen([Elem|_], Elem, Base, Base).
+nth_gen([_|Tail], Elem, N, Base) :-
+        succ(N, M),
+        nth_gen(Tail, Elem, M, Base).
 
-%	nth1(?Index, ?List, ?Elem)
-%	Is true when Elem is the Index'th element of List. Counting starts
-%	at 1.
 
+%%  nth1(?Index, ?List, ?Elem)
+%%  Is true when Elem is the Index'th element of List.  Counting starts
+%%  at 1.  [This is a faster version of the original SWI-Prolog predicate.]
+
+nth1(Index1, List, Elem) :-
+        integer(Index1), !,
+        Index0 is Index1 - 1,
+        nth0_det(Index0, List, Elem).   %% take nth deterministically
 nth1(Index, List, Elem) :-
-	integer(Index), !,
-	N is Index - 1,
-	nth0_1(N, List, Elem).
-nth1(Index, List, Elem) :-
-	var(Index),
-	nth0_2(N, List, Elem),
-	Index is N + 1.
+        var(Index), !,
+        nth_gen(List, Elem, 1, Index).  %% match
 
 %	last(?Elem, ?List)
 %	Succeeds if `Last' unifies with the last element of `List'.
+%	Modified after discussion on the comp.lang.prolog.  This version
+%	is a little faster and deterministic as well as logical.
 
-last(Elem, [Elem]).
-last(Elem, [_|List]) :-
-	last(Elem, List).
+last(Elem, [H|T]) :-
+	last(T, H, Elem).
+
+last([], X, X).
+last([H|T], _, X) :-
+	last(T, H, X).
 
 %	reverse(?List1, ?List2)
 %	Is true when the elements of List2 are in reverse order compared to
@@ -110,7 +117,8 @@ $reverse([Head|List1], List2, List3) :-
 %	Is true when Lis2 is a non nested version of List1.
 
 flatten(List, FlatList) :-
-	$flatten(List, [], FlatList), !.
+	$flatten(List, [], FlatList0), !,
+	FlatList = FlatList0.
 
 $flatten(Var, Tl, [Var|Tl]) :-
 	var(Var), !.
@@ -139,12 +147,19 @@ is_set([_|T]) :-
 %	list_to_set(+List, ?Set)
 %	is true when Set has the same element as List in the same order
 
-list_to_set([], []).
-list_to_set([H|T], R) :-
-	memberchk(H, T), !, 
-	list_to_set(T, R).
-list_to_set([H|T], [H|R]) :-
-	list_to_set(T, R).
+list_to_set(List, Set) :-
+	list_to_set_(List, Set0),
+	Set = Set0.
+
+list_to_set_([], R) :-
+	close_list(R).
+list_to_set_([H|T], R) :-
+	memberchk(H, R), !, 
+	list_to_set_(T, R).
+
+close_list([]) :- !.
+close_list([_|T]) :-
+	close_list(T).
 
 %	intersection(+Set1, +Set2, -Set3)
 %	Succeeds if Set3 unifies with the intersection of Set1 and Set2

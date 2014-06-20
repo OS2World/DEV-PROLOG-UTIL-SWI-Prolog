@@ -1,0 +1,83 @@
+echo "****************"
+echo "Making SWI-Prolog 4.0.9 for i386-os2"
+echo "To be installed in /pl-4.0.9/bin/pl.exe"
+echo "Home (libraries) in /pl-4.0.9/lib/pl-4.0.9"
+echo "****************"
+echo "#define PLHOME       \"/pl-4.0.9/lib/pl-4.0.9\""      > parms.h%
+echo "#define DEFSTARTUP   \".plrc\"" >> parms.h%
+echo 4.0.9 | \
+	gawk -F. '{ printf("#define PLVERSION %d\n", $1 * 10000 + $2 * 100 + $3); }' >> parms.h%
+echo "#define ARCH	    \"i386-os2\""       >> parms.h%
+echo "#define C_LIBS	    \"\""       >> parms.h%
+echo "#define C_CC	    \"gcc\""	       >> parms.h%
+echo "#define C_LDFLAGS    \"\""    >> parms.h%
+if cmp -s parms.h% parms.h; then rm parms.h%; else mv parms.h% parms.h; fi
+(cd rc && make COFLAGS="-O2")
+make[1]: Entering directory `/pl-4.0.9/src/rc'
+gcc -I.. -Wall -O2  -DOS2 -DEMX -DO_HPFS -c  html.c -o html.o
+gcc -I.. -Wall -O2  -DOS2 -DEMX -DO_HPFS -c  access.c -o access.o
+gcc -I.. -Wall -O2  -DOS2 -DEMX -DO_HPFS -c  build.c -o build.o
+gcc -I.. -Wall -O2  -DOS2 -DEMX -DO_HPFS -c  util.c -o util.o
+rm -f librc.a
+ar cq librc.a html.o access.o build.o util.o
+ar -s librc.a
+gcc -I.. -Wall -O2  -DOS2 -DEMX -DO_HPFS -c  rc.c -o rc.o
+gcc -o plrc rc.o -L. -llibrc
+make[1]: Leaving directory `/pl-4.0.9/src/rc'
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-atom.c -o pl-atom.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-wam.c -o pl-wam.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-stream.c -o pl-stream.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-error.c -o pl-error.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-arith.c -o pl-arith.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-bag.c -o pl-bag.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-comp.c -o pl-comp.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-rc.c -o pl-rc.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-dwim.c -o pl-dwim.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-ext.c -o pl-ext.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-file.c -o pl-file.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-flag.c -o pl-flag.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-fmt.c -o pl-fmt.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-funct.c -o pl-funct.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-gc.c -o pl-gc.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-glob.c -o pl-glob.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-itf.c -o pl-itf.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-list.c -o pl-list.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-load.c -o pl-load.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-modul.c -o pl-modul.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-op.c -o pl-op.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-os.c -o pl-os.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-prims.c -o pl-prims.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-pro.c -o pl-pro.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-proc.c -o pl-proc.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-prof.c -o pl-prof.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-read.c -o pl-read.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-rec.c -o pl-rec.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-rl.c -o pl-rl.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-setup.c -o pl-setup.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-sys.c -o pl-sys.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-table.c -o pl-table.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-trace.c -o pl-trace.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-util.c -o pl-util.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-wic.c -o pl-wic.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-write.c -o pl-write.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-term.c -o pl-term.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-buffer.c -o pl-buffer.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-thread.c -o pl-thread.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-xterm.c -o pl-xterm.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-feature.c -o pl-feature.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-ctype.c -o pl-ctype.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-main.c -o pl-main.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  pl-extend.c -o pl-extend.o
+gcc  -o pl.exe pl-atom.o pl-wam.o pl-stream.o pl-error.o pl-arith.o pl-bag.o pl-comp.o pl-rc.o pl-dwim.o pl-ext.o pl-file.o pl-flag.o pl-fmt.o pl-funct.o pl-gc.o pl-glob.o pl-itf.o pl-list.o pl-load.o pl-modul.o pl-op.o pl-os.o pl-prims.o pl-pro.o pl-proc.o pl-prof.o pl-read.o pl-rec.o pl-rl.o pl-setup.o pl-sys.o pl-table.o pl-trace.o pl-util.o pl-wic.o pl-write.o pl-term.o pl-buffer.o pl-thread.o pl-xterm.o pl-feature.o pl-ctype.o pl-main.o pl-extend.o   -llibrc 
+./pl.exe -O -o pl.exe.prc -b ../boot/init.pl
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  rc/access.c -o rc/access.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  rc/build.c -o rc/build.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  rc/html.c -o rc/html.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  rc/rc.c -o rc/rc.o
+gcc -I. -I../src -I../src/rc -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -c  rc/util.c -o rc/util.o
+if [ ! -d ../runtime ]; then mkdir -p ../runtime; fi
+if [ ! -d ../runtime/i386-os2 ]; then mkdir -p ../runtime/i386-os2; fi
+rm -f ../runtime/i386-os2/libpl.a
+ar r ../runtime/i386-os2/libpl.a pl-atom.o pl-wam.o pl-stream.o pl-error.o pl-arith.o pl-bag.o pl-comp.o pl-rc.o pl-dwim.o pl-ext.o pl-file.o pl-flag.o pl-fmt.o pl-funct.o pl-gc.o pl-glob.o pl-itf.o pl-list.o pl-load.o pl-modul.o pl-op.o pl-os.o pl-prims.o pl-pro.o pl-proc.o pl-prof.o pl-read.o pl-rec.o pl-rl.o pl-setup.o pl-sys.o pl-table.o pl-trace.o pl-util.o pl-wic.o pl-write.o pl-term.o pl-buffer.o pl-thread.o pl-xterm.o pl-feature.o pl-ctype.o rc/access.o rc/build.o rc/html.o rc/rc.o rc/util.o pl-main.o 
+ar -s ../runtime/i386-os2/libpl.a
+gcc -I. -I../src -Wall -O2 -g -DOS2 -DEMX -DO_HPFS -o plld ../src/plld.c

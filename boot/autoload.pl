@@ -1,4 +1,4 @@
-/*  autoload.pl,v 1.2 1992/09/10 19:42:52 jan Exp
+/*  $Id: autoload.pl,v 1.14 2000/07/07 08:52:52 jan Exp $
 
     Copyright (c) 1990 Jan Wielemaker. All rights reserved.
     jan@swi.psy.uva.nl
@@ -9,12 +9,18 @@
 :- module($autoload,
 	[ $find_library/5
 	, $in_library/2
+	, $define_predicate/1
 	, $update_library_index/0
 	, make_library_index/1
+	, make_library_index/2
+	, autoload/0
+	, autoload/1
 	]).
 
 :- dynamic
 	library_index/3.			% Head x Module x Path
+:- volatile
+	library_index/3.
 
 %	$find_library(+Module, +Name, +Arity, -LoadModule, -Library)
 %
@@ -39,36 +45,59 @@ $in_library(Name, Arity) :-
 	library_index(Head, _, _),
 	functor(Head, Name, Arity).
 
+%	$define_predicate(+Head)
+%	Make sure pred can be called.  First test if the predicate is
+%	defined.  If not, invoke the autoloader.
+
+:- module_transparent
+	$define_predicate/1.
+
+$define_predicate(Head) :-
+	$defined_predicate(Head), !.
+$define_predicate(Term) :-
+	$strip_module(Term, Module, Head),
+	functor(Head, Name, Arity),
+	current_prolog_flag(autoload, true),
+	$find_library(Module, Name, Arity, LoadModule, Library),
+	flag($autoloading, Old, Old+1),
+	(   Module == LoadModule
+	->  ignore(ensure_loaded(Library))
+	;   ignore(Module:use_module(Library, [Name/Arity]))
+	),
+	flag($autoloading, _, Old),
+	$define_predicate(Term).
+
+
 		/********************************
 		*          UPDATE INDEX		*
 		********************************/
 
 $update_library_index :-
-	absolute_file_name('', CWD),
-	user:library_directory(Dir),
-	    update_library_index(CWD, 'INDEX.pl', Dir),
-	fail.
-$update_library_index.
-
-update_library_index(CWD, Index, Dir) :-
-	exists_directory(Dir),
-	concat_atom([Dir, /, Index], IndexFile),
-	access_file(IndexFile, write),
-	chdir(Dir),
-	time_file(Index, IndexTime),
-	expand_file_name('*.pl', Files),
-	(   member(X, ['.'|Files]),
-	    X \== Index,
-	    time_file(X, TX),
-	    TX @> IndexTime
-	->  chdir(CWD),
-	    format(user, 'Rebuilding index for library ~w ... ', Dir),
-	    ttyflush,
-	    library_index(Dir, Index),
-	    format(user, 'ok.~n', []),
-	    clear_library_index
-	;   chdir(CWD)
+	findall(Dir, indexed_directory(Dir), Dirs),
+	update_indices(Dirs, false, Modified),
+	(   Modified == true
+	->  clear_library_index
+	;   true
 	).
+
+indexed_directory(Dir) :-
+	index_file_name(IndexFile, [access(read), access(write)]),
+	file_directory_name(IndexFile, Dir).
+
+update_indices([], M, M).
+update_indices([Dir|T], M0, M) :-
+	make_library_index2(Dir, M1),
+	add_modified(M0, M1, M2),
+	update_indices(T, M2, M).
+
+add_modified(true, _, true) :- !.
+add_modified(_, true, true) :- !.
+add_modified(_,	_,    false).
+
+%	clear_library_index/0
+%
+%	Remove all entries from the index.  First reference will reload
+%	the index.
 
 clear_library_index :-
 	retractall(library_index(_, _, _)).
@@ -80,30 +109,36 @@ clear_library_index :-
 load_library_index :-
 	library_index(_, _, _), !.		% loaded
 load_library_index :-
-	user:library_directory(Dir),
-	    concat_atom([Dir, '/', 'INDEX.pl'], Index),
-	    exists_file(Index),
-	    read_index(Index, Dir),
-	fail.
-load_library_index.
+	findall(Index, index_file_name(Index, [access(read)]), Indices),
+	forall(member(Index, Indices),
+	       read_index(Index)).
 	
-read_index(Index, Dir) :-
+index_file_name(IndexFile, Options) :-
+	absolute_file_name(library('INDEX'),
+			   [ file_type(prolog),
+			     solutions(all),
+			     file_errors(fail)
+			   | Options
+			   ], IndexFile).
+
+read_index(Index) :-
+	print_message(silent, autoload(read_index(Dir))),
+	file_directory_name(Index, Dir),
 	seeing(Old), see(Index),
 	repeat,
 	    read(Term),
-	    (   Term == end_of_file
-	    ->  !
-	    ;   assert_index(Term, Dir),
-	        fail
-	    ),
+	    assert_index(Term, Dir), !,
 	seen, see(Old).
 
+assert_index(end_of_file, _) :- !.
 assert_index(index(Name, Arity, Module, File), Dir) :- !,
 	functor(Head, Name, Arity),
 	concat_atom([Dir, '/', File], Path),
-	assertz(library_index(Head, Module, Path)).
+	assertz(library_index(Head, Module, Path)),
+	fail.
 assert_index(Term, Dir) :-
-	$warning('Illegal term in INDEX.pl of directory ~w: ~w', [Dir, Term]).
+	print_message(error, illegal_autoload_index(Dir, Term)),
+	fail.
 	
 
 		/********************************
@@ -111,34 +146,125 @@ assert_index(Term, Dir) :-
 		********************************/
 
 make_library_index(Dir) :-
-	access_file(Dir, write), !,
-	library_index(Dir, 'INDEX.pl').
-make_library_index(Dir) :-
-	$warning('make_library_index/1: Cannot write ~w', [Dir]).
+	make_library_index2(Dir, _).
 
-library_index(Dir, Index) :-
+make_library_index(Dir, Pattern) :-
+	make_library_index2(Dir, Pattern, _).
+
+make_library_index2(Dir, Modified) :-
+	findall(Pattern, source_file_pattern(Pattern), PatternList),
+	make_library_index2(Dir, PatternList, Modified).
+	
+make_library_index2(Dir, Patterns, Modified) :-
+	once(user:prolog_file_type(PlExt, prolog)),
+	file_name_extension('INDEX', PlExt, Index),
+	concat_atom([Dir, '/', Index], AbsIndex),
+	access_file(AbsIndex, write), !,
 	absolute_file_name('', OldDir),
 	chdir(Dir),
-	expand_file_name('*.pl', Files),
-	delete(Files, Index, PrologFiles),
+	expand_index_file_patterns(Patterns, Files),
+	(   library_index_out_of_date(Index, Files)
+	->  print_message(informational, make(library_index(Dir))),
+	    catch(do_make_library_index(Index, Files),
+		  E,
+		  (   chdir(OldDir),
+		      throw(E)
+		  )),
+	    Modified = true
+	;   Modified = false
+	),
+	chdir(OldDir).
+make_library_index(Dir, _, _) :-
+	throw(error(permission_error(write, index_file, Dir), _)).
+
+source_file_pattern(Pattern) :-
+	user:prolog_file_type(PlExt, prolog),
+	atom_concat('*.', PlExt, Pattern).
+
+expand_index_file_patterns(Patterns, Files) :-
+	maplist(expand_file_name, Patterns, NestedFiles),
+	flatten(NestedFiles, Files).
+
+library_index_out_of_date(Index, _Files) :-
+	\+ exists_file(Index), !.
+library_index_out_of_date(Index, Files) :-
+	time_file(Index, IndexTime),
+	(   time_file('.', DotTime),
+	    DotTime @> IndexTime
+	;   member(File, Files),
+	    time_file(File, FileTime),
+	    FileTime @> IndexTime
+	), !.
+
+
+do_make_library_index(Index, Files) :-
+	$style_check(OldStyle, OldStyle),
+	style_check(-dollar),
 	open(Index, write, Fd),
 	index_header(Fd),
-	checklist(index_file(Fd), PrologFiles),
+	checklist(index_file(Fd), Files),
 	close(Fd),
-	chdir(OldDir).
+	$style_check(_, OldStyle).
 
 index_file(Fd, File) :-
 	open(File, read, In),
 	read(In, Term),
 	close(In),
 	Term = (:- module(Module, Public)), !,
+	file_name_extension(Base, _, File),
 	forall( member(Name/Arity, Public),
 		format(Fd, 'index((~k), ~k, ~k, ~k).~n',
-		       [Name, Arity, Module, File])).
+		       [Name, Arity, Module, Base])).
 index_file(_, _).
 
 index_header(Fd):-
-	format(Fd, '/*  autoload.pl,v 1.2 1992/09/10 19:42:52 jan Exp~n~n', []),
+	format(Fd, '/*  $Id', []),
+	format(Fd, '$~n~n', []),
 	format(Fd, '    Creator: make/0~n~n', []),
 	format(Fd, '    Purpose: Provide index for autoload~n', []),
 	format(Fd, '*/~n~n', []).
+
+		 /*******************************
+		 *	   DO AUTOLOAD		*
+		 *******************************/
+
+%	autoload([options ...]) 
+%
+%	Force all necessary autoloading to be done now.
+
+autoload :-
+	autoload([]).
+
+autoload(Options) :-
+	option(Options, verbose/true, Verbose),
+	$style_check(Old, Old), 
+	style_check(+dollar), 
+	current_prolog_flag(autoload, OldAutoLoad),
+	current_prolog_flag(verbose_autoload, OldVerbose),
+	set_prolog_flag(autoload, false),
+	findall(Pred, needs_autoloading(Pred), Preds),
+	set_prolog_flag(autoload, OldAutoLoad),
+	$style_check(_, Old),
+	(   Preds == []
+	->  true
+	;   set_prolog_flag(autoload, true),
+	    set_prolog_flag(verbose_autoload, Verbose),
+	    checklist($define_predicate, Preds),
+	    set_prolog_flag(autoload, OldAutoLoad),
+	    set_prolog_flag(verbose_autoload, OldVerbose),
+	    autoload(Verbose)		% recurse for possible new
+					% unresolved links
+	).
+	
+needs_autoloading(Module:Head) :-
+	predicate_property(Module:Head, undefined), 
+	\+ predicate_property(Module:Head, imported_from(_)), 
+	functor(Head, Functor, Arity), 
+	$in_library(Functor, Arity).
+
+option(Options, Name/Default, Value) :-
+	(   memberchk(Name = Value, Options)
+	->  true
+	;   Value = Default
+	).
+

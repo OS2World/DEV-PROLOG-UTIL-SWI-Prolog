@@ -4,7 +4,7 @@
         Thank you for reading this file FIRST.
 
 
-OS/2 2.0 Port README by Andreas T"onne. 4.3.1993
+OS/2 2.0 Port README by Andreas T"onne. 4.2.1992
 
 Purpose:
 
@@ -57,9 +57,9 @@ When you are installing the binary distribution look at 4. and 5a.
 
 Do not try to run the 'setup' script. Is is a Unix(tm) shell script anyway.
 Change to the SWI directory 'pl', create a new directory named 'OS2' and copy
-every file from the directory 'src' to the new directory 'OS2'. Change to the 
-directory 'OS2' and copy 'md-os2.h' to 'md.h'.
-You are now ready for compilation.
+every file from the directory 'src' to the new directory 'OS2'. You do not
+need the 'gnu' subdirectory of 'src'. Change to the directory 'OS2' and 
+copy 'md-os2.h' to 'md.h'. You are now ready for compilation.
 
 2. Adaption of the Makefile
 
@@ -69,8 +69,7 @@ to change in the file 'Makefile' the definition for
           CPP= cc -E 
 to 
           CPP= gcc -E 
-however. You also may have to change 'awk' to 'gawk'.
-See the header section of your 'Makefile'. Probably you want to 
+however. See the header section of your 'Makefile'. Probably you want to 
 edit the file 'pl/config.h' as well. Here you may specify the paths for
 the SWI-Prolog home. Please follow the comments carefully. Especially note
 that you have to specify almost every path twice. Once for the Prolog internal
@@ -119,8 +118,8 @@ binaries to a proper place on a HPFS volume. Make sure that the directories
 stay in place (see above). The binary distribution includes an extra directory
 'etc' with a termcap-definition file 'termcap.dat'. The same directory includes
 a copy of the EMX runtime module 'emx.dll'. Copy this to a place in your
-LIBPATH. Next change to the root of the SWI tree and execute 'boot.cmd' and 
-then 'dump.cmd'. This will create a initial saved state as 'bin\pl.cmd'. 
+LIBPATH. Next change to the root of the SWI tree and execute 'dump.cmd'.
+This will create a initial saved state as 'bin\pl.cmd'. 
 
 
 ***************************************************************************
@@ -145,4 +144,6 @@ Differences to the Unix(tm) version:
 Bugs:
 
 - filename conversions assume HPFS.
-
+- open_null_stream is not yet supports. Reason? The creation of ATOMS is
+  too inflexible. We need to change the name of /dev/null to /dev/nul
+  for EMX.
